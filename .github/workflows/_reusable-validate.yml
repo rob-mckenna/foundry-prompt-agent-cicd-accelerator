@@ -37,7 +37,7 @@ jobs:
 
       - name: Set up Terraform
         if: inputs.runTerraformValidate
-        uses: hashicorp/setup-terraform@v3
+        uses: hashicorp/setup-terraform@v4
         with:
           terraform_version: 1.13.5
           terraform_wrapper: false

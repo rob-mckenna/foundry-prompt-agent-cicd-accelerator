@@ -64,7 +64,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Download candidate packages
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: ${{ inputs.packageArtifactName }}
           path: artifacts

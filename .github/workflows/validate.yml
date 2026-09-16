@@ -36,7 +36,7 @@ jobs:
         sample: [simple-agent, rag-agent, multi-tool-agent]
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Build and verify the package
         shell: pwsh

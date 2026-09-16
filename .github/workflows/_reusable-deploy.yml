@@ -84,7 +84,7 @@ jobs:
       CHANGE_RECORD_ID: ${{ inputs.changeRecordId }}
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Download immutable package
         uses: actions/download-artifact@v4

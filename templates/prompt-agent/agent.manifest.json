@@ -1,0 +1,43 @@
+{
+  "$schema": "../../schemas/agent-manifest.schema.json",
+  "schemaVersion": "1.0.0",
+  "name": "replace-agent-name",
+  "version": "1.0.0",
+  "displayName": "REPLACE Display Name",
+  "description": "REPLACE with one sentence describing what this agent does and for whom.",
+  "owner": {
+    "team": "replace-owning-team",
+    "contact": "replace-distribution-list@example.com",
+    "costCenter": "replace-cost-center",
+    "supportUrl": "https://example.com/replace-support-runbook"
+  },
+  "classification": {
+    "dataSensitivity": "internal",
+    "businessCriticality": "medium",
+    "processesPersonalData": false,
+    "humanInTheLoop": false
+  },
+  "model": {
+    "deploymentName": "gpt-4o-mini",
+    "modelFamily": "gpt-4o",
+    "parameters": {
+      "temperature": 0.2,
+      "topP": 0.95
+    },
+    "responseFormat": {
+      "type": "text"
+    }
+  },
+  "instructions": {
+    "file": "instructions.md",
+    "maxLength": 256000
+  },
+  "tools": [],
+  "evaluations": {
+    "suiteFile": "evaluations/baseline.evaluation.json",
+    "required": true
+  },
+  "metadata": {
+    "service": "replace-service-name"
+  }
+}

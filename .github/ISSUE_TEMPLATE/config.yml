@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/OWNER/foundry-prompt-agent-cicd-accelerator/security/advisories/new
+    about: Report security issues privately, never as a public issue. See SECURITY.md.
+  - name: Azure AI Foundry documentation
+    url: https://learn.microsoft.com/azure/ai-foundry/
+    about: Questions about the Azure service itself rather than this accelerator.

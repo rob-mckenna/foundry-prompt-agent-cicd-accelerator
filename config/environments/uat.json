@@ -1,0 +1,70 @@
+{
+  "$schema": "../../schemas/environment-config.schema.json",
+  "schemaVersion": "1.0.0",
+  "environment": "uat",
+  "displayName": "User acceptance test",
+  "azure": {
+    "tenantId": "${env:AZURE_TENANT_ID}",
+    "subscriptionId": "${env:AZURE_SUBSCRIPTION_ID}",
+    "resourceGroup": "rg-foundry-agents-uat",
+    "location": "eastus2"
+  },
+  "foundry": {
+    "accountName": "aifagentsuat",
+    "projectName": "proj-agents-uat",
+    "projectEndpoint": "https://aifagentsuat.services.ai.azure.com/api/projects/proj-agents-uat",
+    "apiVersion": "v1",
+    "tokenScope": "https://ai.azure.com/.default",
+    "defaultModelDeployment": "gpt-4o"
+  },
+  "keyVault": {
+    "name": "kv-fnd-agents-uat",
+    "uri": "https://kv-fnd-agents-uat.vault.azure.net/"
+  },
+  "runtime": {
+    "allowedVariables": [
+      "AZURE_SUBSCRIPTION_ID",
+      "AZURE_TENANT_ID",
+      "SEARCH_INDEX_NAME",
+      "VECTOR_STORE_ID"
+    ]
+  },
+  "packageStore": {
+    "type": "azureBlob",
+    "accountName": "stfndagentsuat",
+    "container": "agent-packages"
+  },
+  "releaseStore": {
+    "type": "azureBlob",
+    "accountName": "stfndagentsuat",
+    "container": "agent-releases"
+  },
+  "deployment": {
+    "autoDeploy": false,
+    "approvalRequired": true,
+    "approverGroups": [
+      "agent-platform-approvers",
+      "business-owners"
+    ],
+    "changeWindow": "Scheduled UAT cycles. Promotion from TEST only. Business sign-off recorded against the release id.",
+    "rollbackMode": "redeploy-previous-package"
+  },
+  "governance": {
+    "allowedToolTypes": [
+      "code_interpreter",
+      "file_search",
+      "azure_ai_search",
+      "openapi",
+      "azure_function",
+      "function"
+    ],
+    "maxDataSensitivity": "confidential",
+    "requireOwnerMetadata": true,
+    "requireResponsibleAiReview": true,
+    "changeRecordPattern": "^[A-Za-z]{2,5}-[0-9]{4,10}$",
+    "requiredMetadataKeys": [
+      "service"
+    ],
+    "maxTemperature": 0.7
+  }
+}

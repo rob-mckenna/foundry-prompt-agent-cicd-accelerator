@@ -1,0 +1,44 @@
+{
+  "$schema": "../../schemas/agent-manifest.schema.json",
+  "schemaVersion": "1.0.0",
+  "name": "simple-support-agent",
+  "version": "1.0.0",
+  "displayName": "Contoso Support Assistant",
+  "description": "Answers common customer support questions about accounts, billing and delivery in plain language.",
+  "owner": {
+    "team": "customer-experience-platform",
+    "contact": "cx-platform@contoso.example.com",
+    "costCenter": "CX-1042",
+    "supportUrl": "https://contoso.example.com/runbooks/support-assistant"
+  },
+  "classification": {
+    "dataSensitivity": "internal",
+    "businessCriticality": "medium",
+    "processesPersonalData": false,
+    "humanInTheLoop": true,
+    "responsibleAiReviewId": "RAI-2026-0187"
+  },
+  "model": {
+    "deploymentName": "gpt-4o-mini",
+    "modelFamily": "gpt-4o",
+    "parameters": {
+      "temperature": 0.3,
+      "topP": 0.95
+    },
+    "responseFormat": {
+      "type": "text"
+    }
+  },
+  "instructions": {
+    "file": "instructions.md"
+  },
+  "tools": [],
+  "evaluations": {
+    "suiteFile": "evaluations/baseline.evaluation.json",
+    "required": true
+  },
+  "metadata": {
+    "service": "customer-support",
+    "pattern": "simple-agent"
+  }
+}

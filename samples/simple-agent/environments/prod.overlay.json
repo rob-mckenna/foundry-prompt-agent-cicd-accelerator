@@ -1,0 +1,22 @@
+{
+  "$schema": "../../../schemas/environment-overlay.schema.json",
+  "schemaVersion": "1.0.0",
+  "environment": "prod",
+  "model": {
+    "deploymentName": "gpt-4o",
+    "parameters": {
+      "temperature": 0.1
+    }
+  },
+  "variables": {},
+  "metadata": {
+    "environment": "prod",
+    "change_record": "${env:CHANGE_RECORD_ID}"
+  },
+  "deploymentGates": {
+    "requireEvaluationPass": true,
+    "requireSmokeTestPass": true,
+    "requireRegressionPass": true,
+    "minimumEvaluationScore": 0.9
+  }
+}

@@ -1,0 +1,61 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/foundry-prompt-agent-cicd-accelerator/schemas/package-descriptor.schema.json",
+  "title": "Immutable Agent Package Descriptor",
+  "description": "package.json emitted by scripts/New-AgentPackage.ps1. The descriptor plus checksums.sha256 make the package content-addressable; promotion re-uses the identical artifact.",
+  "type": "object",
+  "required": ["schemaVersion", "packageFormat", "packageId", "agent", "build", "contents", "checksumFile"],
+  "additionalProperties": false,
+  "properties": {
+    "$schema": { "type": "string" },
+    "schemaVersion": { "const": "1.0.0" },
+    "packageFormat": { "const": "foundry-agent-package/1" },
+    "packageId": {
+      "type": "string",
+      "pattern": "^sha256:[a-f0-9]{64}$",
+      "description": "SHA-256 of the canonical checksum manifest. Identifies the package content independently of file name."
+    },
+    "agent": {
+      "type": "object",
+      "required": ["name", "version"],
+      "additionalProperties": false,
+      "properties": {
+        "name": { "type": "string" },
+        "version": { "type": "string" },
+        "displayName": { "type": "string" },
+        "owner": { "type": "object", "additionalProperties": true },
+        "classification": { "type": "object", "additionalProperties": true }
+      }
+    },
+    "build": {
+      "type": "object",
+      "required": ["createdUtc", "sourceCommit", "builder"],
+      "additionalProperties": false,
+      "properties": {
+        "createdUtc": { "type": "string", "format": "date-time" },
+        "sourceCommit": { "type": "string", "description": "Full Git commit SHA the package was built from, or 'unknown' for local builds." },
+        "sourceRef": { "type": "string" },
+        "sourceRepository": { "type": "string" },
+        "buildRunId": { "type": "string" },
+        "buildRunUrl": { "type": "string" },
+        "builder": { "type": "string", "description": "github-actions, azure-pipelines or local." },
+        "toolVersion": { "type": "string" }
+      }
+    },
+    "contents": {
+      "type": "object",
+      "required": ["manifest", "instructions", "environments"],
+      "additionalProperties": false,
+      "properties": {
+        "manifest": { "type": "string" },
+        "instructions": { "type": "string" },
+        "environments": { "type": "array", "items": { "enum": ["dev", "test", "uat", "prod"] }, "minItems": 1 },
+        "tools": { "type": "array", "items": { "type": "string" } },
+        "evaluations": { "type": "array", "items": { "type": "string" } },
+        "attachments": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "checksumFile": { "const": "checksums.sha256" },
+    "fileCount": { "type": "integer", "minimum": 1 }
+  }
+}

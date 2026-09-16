@@ -1,0 +1,149 @@
+name: deploy-prod
+
+# Promotes an unchanged, UAT-verified package to production.
+#
+# Controls, in order:
+#   1. Trigger is manual or a release tag matching v*.*.* on main. No push to main reaches production.
+#   2. `preflight` refuses to continue unless the artifact matches the package id recorded for UAT, the
+#      package passes verification, and a change record id was supplied.
+#   3. The `prod` GitHub Environment applies required reviewers and a wait timer before the deploy job starts.
+#   4. Smoke and regression tests run after deployment; failure triggers automatic rollback to the previously
+#      promoted package.
+#
+# Set up in GitHub before first use:
+#   1. Environment 'prod' with required reviewers (platform team plus service owner), a wait timer, and a
+#      deployment branch and tag policy limited to main and v*.*.* tags.
+#   2. Environment variables AZURE_CLIENT_ID, AZURE_TENANT_ID, AZURE_SUBSCRIPTION_ID for production.
+#   3. Federated credentials for repo:<owner>/<repo>:environment:prod and, if you use tags,
+#      repo:<owner>/<repo>:ref:refs/tags/v*.
+#   4. Ruleset on main: require pull request review, require the validate status check, block force push.
+
+on:
+  workflow_dispatch:
+    inputs:
+      sourceRunId:
+        description: Run id of the deploy-test workflow that promoted this package to UAT.
+        type: string
+        required: true
+      agentName:
+        description: Logical agent name.
+        type: string
+        required: true
+        default: simple-support-agent
+      changeRecordId:
+        description: Approved change record id. Recorded in agent metadata and in the release record.
+        type: string
+        required: true
+      evaluationSuitePath:
+        description: Evaluation suite to run after deployment. Leave empty to skip.
+        type: string
+        required: false
+        default: ''
+      confirmProduction:
+        description: Type the agent name again to confirm a production change.
+        type: string
+        required: true
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: deploy-prod-${{ inputs.agentName }}
+  cancel-in-progress: false
+
+jobs:
+  preflight:
+    name: Production preflight
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      packageFile: ${{ steps.inspect.outputs.packageFile }}
+      packageId: ${{ steps.inspect.outputs.packageId }}
+      agentVersion: ${{ steps.inspect.outputs.agentVersion }}
+    steps:
+      - name: Confirm the operator typed the agent name
+        if: inputs.confirmProduction != inputs.agentName
+        run: |
+          echo "::error::confirmProduction ('${{ inputs.confirmProduction }}') does not match agentName ('${{ inputs.agentName }}'). Aborting before any production change."
+          exit 1
+
+      - name: Require a change record id
+        shell: bash
+        run: |
+          if [[ ! "${{ inputs.changeRecordId }}" =~ ^[A-Za-z]{2,5}-[0-9]{4,10}$ ]]; then
+            echo "::error::changeRecordId '${{ inputs.changeRecordId }}' does not look like a change record (expected for example CHG-0043912)."
+            exit 1
+          fi
+
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Download the UAT-verified package
+        uses: actions/download-artifact@v4
+        with:
+          name: promoted-package
+          path: artifacts
+          run-id: ${{ inputs.sourceRunId }}
+          github-token: ${{ github.token }}
+
+      - name: Verify the package for production
+        id: inspect
+        shell: pwsh
+        run: |
+          Set-StrictMode -Version 3.0
+          $ErrorActionPreference = 'Stop'
+          $package = Get-ChildItem ./artifacts -Filter '*.zip' -Recurse | Select-Object -First 1
+          if (-not $package) { throw "Run ${{ inputs.sourceRunId }} produced no promoted package artifact." }
+          $result = ./scripts/Test-AgentPackage.ps1 -PackagePath $package.FullName -Environment prod
+          if ($result.AgentName -ne '${{ inputs.agentName }}') {
+            throw "Artifact holds agent '$($result.AgentName)' but '${{ inputs.agentName }}' was requested."
+          }
+          "packageFile=$($package.Name)"    | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "packageId=$($result.PackageId)"  | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "agentVersion=$($result.Version)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Re-upload for the deployment job
+        uses: actions/upload-artifact@v4
+        with:
+          name: production-package
+          path: artifacts/*.zip
+          if-no-files-found: error
+          retention-days: 365
+
+      - name: Publish the change summary for approvers
+        shell: bash
+        run: |
+          {
+            echo "### Production change awaiting approval"
+            echo ""
+            echo "| Field | Value |"
+            echo "| --- | --- |"
+            echo "| Agent | \`${{ inputs.agentName }}\` |"
+            echo "| Version | \`${{ steps.inspect.outputs.agentVersion }}\` |"
+            echo "| Package id | \`${{ steps.inspect.outputs.packageId }}\` |"
+            echo "| Change record | \`${{ inputs.changeRecordId }}\` |"
+            echo "| Source run | [${{ inputs.sourceRunId }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ inputs.sourceRunId }}) |"
+            echo "| Requested by | ${{ github.actor }} |"
+            echo ""
+            echo "Approvers: confirm the package id above matches the one recorded for UAT before approving."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  deploy-prod:
+    name: Deploy to PROD
+    needs: preflight
+    uses: ./.github/workflows/_reusable-deploy.yml
+    with:
+      environment: prod
+      targetEnvironment: prod
+      agentName: ${{ inputs.agentName }}
+      agentVersion: ${{ needs.preflight.outputs.agentVersion }}
+      artifactName: production-package
+      packageFile: ${{ needs.preflight.outputs.packageFile }}
+      operation: promote
+      sourceEnvironment: uat
+      runEvaluations: ${{ inputs.evaluationSuitePath != '' }}
+      evaluationSuitePath: ${{ inputs.evaluationSuitePath }}
+      runRegression: true
+      validateSecretReferences: true
+      changeRecordId: ${{ inputs.changeRecordId }}

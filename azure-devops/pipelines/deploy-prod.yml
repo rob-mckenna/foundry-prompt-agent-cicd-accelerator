@@ -1,0 +1,126 @@
+# Production promotion. Manual trigger only, with a preflight gate before the approval gate.
+#
+# Controls, in order:
+#   1. Manual trigger with a mandatory change record id and a typed confirmation of the agent name.
+#   2. The preflight stage verifies the artifact, confirms it holds the requested agent and refuses a
+#      malformed change record. It runs before the environment approval so that approvers are asked to
+#      approve a change that is already known to be well formed.
+#   3. The 'foundry-agents-prod' Azure DevOps Environment applies approvals, business hours and exclusive
+#      lock checks.
+#   4. Smoke and regression tests run after deployment; failure triggers automatic rollback to the
+#      previously promoted package.
+#
+# Set up in Azure DevOps before first use:
+#   1. Service connection 'foundry-agents-prod' using workload identity federation.
+#   2. Variable group 'foundry-agents-prod' with azureSubscriptionId and azureTenantId.
+#   3. Environment 'foundry-agents-prod' with an approval check naming the platform team and the service
+#      owner, a business hours check, and an exclusive lock.
+#   4. Branch control check on the environment restricting deployments to main.
+#   5. Set the pipeline resource 'testPipeline' source below to the name of your TEST pipeline.
+
+name: deploy-prod-$(Date:yyyyMMdd)$(Rev:.r)
+
+trigger: none
+pr: none
+
+resources:
+  pipelines:
+    - pipeline: testPipeline
+      source: foundry-agents-deploy-test
+      trigger: none
+
+pool:
+  vmImage: ubuntu-latest
+
+parameters:
+  - name: agentName
+    displayName: Logical agent name
+    type: string
+    default: simple-support-agent
+  - name: agentVersion
+    displayName: Agent version being promoted
+    type: string
+    default: 1.0.0
+  - name: changeRecordId
+    displayName: Approved change record id (for example CHG-0043912)
+    type: string
+  - name: confirmProduction
+    displayName: Type the agent name again to confirm
+    type: string
+  - name: evaluationSuitePath
+    displayName: Evaluation suite path (empty to skip)
+    type: string
+    default: ''
+
+variables:
+  - template: templates/variables/common.yml
+
+stages:
+  - stage: preflight
+    displayName: Production preflight
+    jobs:
+      - job: guards
+        displayName: Confirm inputs and verify the artifact
+        timeoutInMinutes: 20
+        steps:
+          - checkout: self
+
+          - task: PowerShell@2
+            displayName: Confirm inputs
+            inputs:
+              pwsh: true
+              targetType: inline
+              script: |
+                Set-StrictMode -Version 3.0
+                $ErrorActionPreference = 'Stop'
+                if ('${{ parameters.confirmProduction }}' -cne '${{ parameters.agentName }}') {
+                  throw "confirmProduction does not match agentName. Aborting before any production change."
+                }
+                if ('${{ parameters.changeRecordId }}' -notmatch '^[A-Za-z]{2,5}-[0-9]{4,10}$') {
+                  throw "changeRecordId '${{ parameters.changeRecordId }}' does not look like a change record (expected for example CHG-0043912)."
+                }
+                Write-Host "Inputs confirmed for ${{ parameters.agentName }} under change ${{ parameters.changeRecordId }}."
+
+          - download: testPipeline
+            artifact: agentPackage
+            displayName: Download the UAT-verified package
+
+          - task: PowerShell@2
+            displayName: Verify the package for production
+            inputs:
+              pwsh: true
+              targetType: inline
+              workingDirectory: $(Build.SourcesDirectory)
+              script: |
+                Set-StrictMode -Version 3.0
+                $ErrorActionPreference = 'Stop'
+                $package = Get-ChildItem '$(Pipeline.Workspace)' -Recurse -Filter '*.zip' -File | Select-Object -First 1
+                if (-not $package) { throw 'No package artifact was downloaded from the TEST pipeline.' }
+                $result = ./scripts/Test-AgentPackage.ps1 -PackagePath $package.FullName -Environment prod
+                if ($result.AgentName -ne '${{ parameters.agentName }}') {
+                  throw "Artifact holds agent '$($result.AgentName)' but '${{ parameters.agentName }}' was requested."
+                }
+                Write-Host "Package id $($result.PackageId) verified for production."
+                Write-Host "##vso[task.logissue type=warning]Approvers: confirm package id $($result.PackageId) matches the id recorded for UAT."
+
+  - template: templates/stages/deploy-stage.yml
+    parameters:
+      stageName: deployProd
+      displayName: Deploy to PROD
+      dependsOn: [preflight]
+      environmentName: prod
+      azureDevOpsEnvironment: foundry-agents-prod
+      serviceConnection: foundry-agents-prod
+      variableGroup: foundry-agents-prod
+      agentName: ${{ parameters.agentName }}
+      agentVersion: ${{ parameters.agentVersion }}
+      operation: promote
+      sourceEnvironment: uat
+      packageArtifactName: agentPackage
+      sourcePipelineResource: testPipeline
+      runEvaluations: ${{ ne(parameters.evaluationSuitePath, '') }}
+      evaluationSuitePath: ${{ parameters.evaluationSuitePath }}
+      runRegression: true
+      validateSecretReferences: true
+      rollbackOnFailure: true
+      changeRecordId: ${{ parameters.changeRecordId }}

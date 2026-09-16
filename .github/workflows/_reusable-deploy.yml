@@ -1,0 +1,204 @@
+name: _reusable-deploy
+
+# Deploys or promotes one immutable package to one environment.
+#
+# Approval control: the caller passes `environment`, which binds this job to a GitHub Environment. Required
+# reviewers, wait timers and deployment branch policies configured on that environment gate the job before
+# any step runs. There is no approval logic in this workflow, on purpose: the platform enforces it.
+#
+# Authentication: OIDC only. `permissions: id-token: write` plus azure/login@v2 with client id, tenant id and
+# subscription id supplied as environment *variables*, not secrets. No client secret exists.
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: GitHub Environment name. Must match the target environment (dev, test, uat, prod).
+        type: string
+        required: true
+      targetEnvironment:
+        description: Accelerator environment key used to select config/environments/<key>.json.
+        type: string
+        required: true
+      agentName:
+        description: Logical agent name.
+        type: string
+        required: true
+      agentVersion:
+        description: Agent version, used by the smoke test to confirm what landed.
+        type: string
+        required: true
+      artifactName:
+        description: Artifact holding the immutable package.
+        type: string
+        default: agent-package
+      packageFile:
+        description: Package file name inside the artifact.
+        type: string
+        required: true
+      operation:
+        description: deploy or promote.
+        type: string
+        default: deploy
+      sourceEnvironment:
+        description: Environment the package is promoted from. Empty for a direct deploy.
+        type: string
+        default: ''
+      runEvaluations:
+        description: Run the agent evaluation suite after deployment.
+        type: boolean
+        default: false
+      evaluationSuitePath:
+        description: Path to the evaluation suite, relative to the repository root.
+        type: string
+        default: ''
+      runRegression:
+        description: Run regression tests after deployment.
+        type: boolean
+        default: false
+      validateSecretReferences:
+        description: Confirm the deployment identity can read every Key Vault reference before writing.
+        type: boolean
+        default: false
+      changeRecordId:
+        description: Change record id recorded in agent metadata for production deployments.
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  deploy:
+    name: Deploy to ${{ inputs.targetEnvironment }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    environment:
+      name: ${{ inputs.environment }}
+    env:
+      # Non-secret identifiers. Store them as GitHub Environment variables, not secrets.
+      AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+      AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+      AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      CHANGE_RECORD_ID: ${{ inputs.changeRecordId }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Download immutable package
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.artifactName }}
+          path: artifacts
+
+      - name: Verify package before deployment
+        shell: pwsh
+        run: |
+          Set-StrictMode -Version 3.0
+          $ErrorActionPreference = 'Stop'
+          ./scripts/Test-AgentPackage.ps1 `
+            -PackagePath "./artifacts/${{ inputs.packageFile }}" `
+            -Environment ${{ inputs.targetEnvironment }}
+
+      - name: Sign in to Azure with workload identity federation
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Deploy package
+        if: inputs.operation == 'deploy'
+        shell: pwsh
+        run: |
+          Set-StrictMode -Version 3.0
+          $ErrorActionPreference = 'Stop'
+          $parameters = @{
+            PackagePath      = "./artifacts/${{ inputs.packageFile }}"
+            Environment      = '${{ inputs.targetEnvironment }}'
+            Operation        = 'deploy'
+            ReleaseDirectory = './out/releases'
+            GateResult       = @{ validation = 'passed' }
+          }
+          if ('${{ inputs.validateSecretReferences }}' -eq 'true') { $parameters['ValidateSecretReferences'] = $true }
+          ./scripts/import-agent.ps1 @parameters
+
+      - name: Promote package
+        if: inputs.operation == 'promote'
+        shell: pwsh
+        run: |
+          Set-StrictMode -Version 3.0
+          $ErrorActionPreference = 'Stop'
+          ./scripts/promote-agent.ps1 `
+            -AgentName '${{ inputs.agentName }}' `
+            -FromEnvironment '${{ inputs.sourceEnvironment }}' `
+            -ToEnvironment '${{ inputs.targetEnvironment }}' `
+            -PackagePath "./artifacts/${{ inputs.packageFile }}" `
+            -ReleaseDirectory './out/releases' `
+            -GateResult @{ validation = 'passed' }
+
+      - name: Smoke test
+        shell: pwsh
+        run: |
+          Set-StrictMode -Version 3.0
+          $ErrorActionPreference = 'Stop'
+          ./tests/smoke/Invoke-SmokeTest.ps1 `
+            -Environment '${{ inputs.targetEnvironment }}' `
+            -AgentName '${{ inputs.agentName }}' `
+            -ExpectedVersion '${{ inputs.agentVersion }}' `
+            -ResultPath './out/smoke-${{ inputs.targetEnvironment }}.json'
+
+      - name: Evaluations
+        if: inputs.runEvaluations && inputs.evaluationSuitePath != ''
+        shell: pwsh
+        run: |
+          Set-StrictMode -Version 3.0
+          $ErrorActionPreference = 'Stop'
+          ./tests/evaluations/Invoke-EvaluationSuite.ps1 `
+            -SuitePath '${{ inputs.evaluationSuitePath }}' `
+            -Environment '${{ inputs.targetEnvironment }}' `
+            -AgentName '${{ inputs.agentName }}' `
+            -ResultPath './out/evaluation-${{ inputs.targetEnvironment }}.json'
+
+      - name: Regression tests
+        if: inputs.runRegression
+        shell: pwsh
+        run: |
+          Set-StrictMode -Version 3.0
+          $ErrorActionPreference = 'Stop'
+          ./tests/regression/Invoke-RegressionTest.ps1 `
+            -Environment '${{ inputs.targetEnvironment }}' `
+            -AgentName '${{ inputs.agentName }}' `
+            -ResultPath './out/regression-${{ inputs.targetEnvironment }}.json'
+
+      - name: Upload release record and test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ inputs.targetEnvironment }}-${{ github.run_id }}
+          path: out/
+          if-no-files-found: ignore
+          retention-days: 365
+
+      - name: Roll back on failure
+        if: failure() && inputs.targetEnvironment != 'dev'
+        shell: pwsh
+        run: |
+          Set-StrictMode -Version 3.0
+          $ErrorActionPreference = 'Continue'
+          Write-Host "::warning::Deployment or post-deployment testing failed in '${{ inputs.targetEnvironment }}'. Attempting rollback to the previously promoted package."
+          try {
+            ./scripts/Invoke-Rollback.ps1 `
+              -AgentName '${{ inputs.agentName }}' `
+              -Environment '${{ inputs.targetEnvironment }}' `
+              -ArtifactDirectory './artifacts' `
+              -ReleaseDirectory './out/releases' `
+              -Reason 'Automatic rollback: run ${{ github.run_id }} failed.' `
+              -Confirm:$false
+          }
+          catch {
+            Write-Host "::error::Automatic rollback failed: $($_.Exception.Message)"
+            Write-Host "::error::Follow the manual procedure in docs/deployment-runbook.md."
+            exit 1
+          }

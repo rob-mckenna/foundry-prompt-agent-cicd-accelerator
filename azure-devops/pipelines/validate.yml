@@ -1,0 +1,65 @@
+# Pull request validation. Fully offline: no service connection, no Azure credentials, no deployment.
+# Configure this pipeline as a required build validation policy on the main branch.
+
+name: validate-$(Date:yyyyMMdd)$(Rev:.r)
+
+trigger:
+  branches:
+    include:
+      - main
+
+pr:
+  branches:
+    include:
+      - main
+
+pool:
+  vmImage: ubuntu-latest
+
+variables:
+  - template: templates/variables/common.yml
+
+stages:
+  - stage: validate
+    displayName: Offline validation
+    jobs:
+      - job: offlineValidation
+        displayName: Schema, YAML, PowerShell and IaC checks
+        timeoutInMinutes: 25
+        steps:
+          - checkout: self
+          - template: templates/steps/validate.yml
+            parameters:
+              runTerraformValidate: true
+              installPester: true
+
+      - job: packageSamples
+        displayName: Package and verify samples
+        dependsOn: offlineValidation
+        timeoutInMinutes: 20
+        strategy:
+          matrix:
+            simple:
+              samplePath: samples/simple-agent
+            rag:
+              samplePath: samples/rag-agent
+            multiTool:
+              samplePath: samples/multi-tool-agent
+        steps:
+          - checkout: self
+          - task: PowerShell@2
+            displayName: Build, verify and confirm reproducibility
+            inputs:
+              pwsh: true
+              targetType: inline
+              workingDirectory: $(Build.SourcesDirectory)
+              script: |
+                Set-StrictMode -Version 3.0
+                $ErrorActionPreference = 'Stop'
+                $first = ./scripts/New-AgentPackage.ps1 -AgentPath '$(samplePath)' -OutputDirectory ./out/a -SourceCommit '$(Build.SourceVersion)'
+                ./scripts/Test-AgentPackage.ps1 -PackagePath $first.PackagePath
+                $second = ./scripts/New-AgentPackage.ps1 -AgentPath '$(samplePath)' -OutputDirectory ./out/b -SourceCommit '$(Build.SourceVersion)'
+                if ($first.PackageId -ne $second.PackageId) {
+                  throw "Package build is not reproducible: $($first.PackageId) vs $($second.PackageId)."
+                }
+                Write-Host "Reproducible content address: $($first.PackageId)"

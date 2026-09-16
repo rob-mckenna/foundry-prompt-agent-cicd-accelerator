@@ -1,0 +1,69 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/foundry-prompt-agent-cicd-accelerator/schemas/environment-overlay.schema.json",
+  "title": "Environment Overlay",
+  "description": "Environment-specific differences applied on top of an agent manifest at deploy time. Overlays ship inside the immutable package so that promotion never rebuilds the package.",
+  "type": "object",
+  "required": ["schemaVersion", "environment"],
+  "additionalProperties": false,
+  "properties": {
+    "$schema": { "type": "string" },
+    "schemaVersion": { "const": "1.0.0" },
+    "environment": { "enum": ["dev", "test", "uat", "prod"] },
+    "model": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "deploymentName": { "type": "string", "minLength": 1 },
+        "parameters": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "temperature": { "type": "number", "minimum": 0, "maximum": 2 },
+            "topP": { "type": "number", "minimum": 0, "maximum": 1 }
+          }
+        }
+      }
+    },
+    "toolOverrides": {
+      "type": "object",
+      "description": "Keyed by tool id. Each value is deep-merged over the packaged tool definition.",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": { "type": "boolean" },
+          "config": { "type": "object", "additionalProperties": true }
+        }
+      }
+    },
+    "variables": {
+      "type": "object",
+      "description": "Non-secret values substituted into ${env:NAME} placeholders. Values must not contain credentials.",
+      "additionalProperties": { "type": "string" }
+    },
+    "secretRefs": {
+      "type": "object",
+      "description": "Maps placeholder names to Key Vault references. Resolved at deploy time with the pipeline workload identity; values are never written to logs or to the package.",
+      "additionalProperties": {
+        "type": "string",
+        "pattern": "^@Microsoft\\.KeyVault\\(VaultName=[A-Za-z0-9-]{3,24};SecretName=[A-Za-z0-9-]{1,127}(;SecretVersion=[A-Za-z0-9]+)?\\)$"
+      }
+    },
+    "metadata": {
+      "type": "object",
+      "maxProperties": 8,
+      "additionalProperties": { "type": "string", "maxLength": 512 }
+    },
+    "deploymentGates": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "requireEvaluationPass": { "type": "boolean", "default": false },
+        "requireSmokeTestPass": { "type": "boolean", "default": true },
+        "requireRegressionPass": { "type": "boolean", "default": false },
+        "minimumEvaluationScore": { "type": "number", "minimum": 0, "maximum": 5 }
+      }
+    }
+  }
+}

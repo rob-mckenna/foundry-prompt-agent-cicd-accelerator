@@ -1,0 +1,40 @@
+{
+  "$schema": "../../../schemas/environment-overlay.schema.json",
+  "schemaVersion": "1.0.0",
+  "environment": "dev",
+  "model": {
+    "deploymentName": "gpt-4o-mini",
+    "parameters": {
+      "temperature": 0.3
+    }
+  },
+  "toolOverrides": {
+    "knowledge-search": {
+      "config": {
+        "indexName": "ops-dev-v1"
+      }
+    },
+    "code-interpreter": {
+      "enabled": true
+    },
+    "web-grounding": {
+      "enabled": true
+    }
+  },
+  "variables": {
+    "SEARCH_CONNECTION_ID": "/subscriptions/${env:AZURE_SUBSCRIPTION_ID}/resourceGroups/rg-foundry-agents-dev/providers/Microsoft.CognitiveServices/accounts/aifagentsdev/projects/proj-agents-dev/connections/ops-search",
+    "SEARCH_INDEX_NAME": "ops-dev-v1",
+    "ORDERS_API_CONNECTION_ID": "/subscriptions/${env:AZURE_SUBSCRIPTION_ID}/resourceGroups/rg-foundry-agents-dev/providers/Microsoft.CognitiveServices/accounts/aifagentsdev/projects/proj-agents-dev/connections/orders-api",
+    "FUNCTION_QUEUE_ENDPOINT": "https://stfndagentsdev.queue.core.windows.net",
+    "BING_CONNECTION_ID": "/subscriptions/${env:AZURE_SUBSCRIPTION_ID}/resourceGroups/rg-foundry-agents-dev/providers/Microsoft.CognitiveServices/accounts/aifagentsdev/projects/proj-agents-dev/connections/bing-grounding"
+  },
+  "secretRefs": {},
+  "metadata": {
+    "environment": "dev"
+  },
+  "deploymentGates": {
+    "requireEvaluationPass": false,
+    "requireSmokeTestPass": true,
+    "requireRegressionPass": false
+  }
+}

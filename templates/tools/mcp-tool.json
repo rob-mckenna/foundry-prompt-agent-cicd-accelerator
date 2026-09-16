@@ -1,0 +1,25 @@
+{
+  "$schema": "../../schemas/tool-definition.schema.json",
+  "schemaVersion": "1.0.0",
+  "id": "partner-mcp",
+  "type": "mcp",
+  "displayName": "Partner MCP server",
+  "description": "Connects to an approved Model Context Protocol server.",
+  "config": {
+    "serverLabel": "partner_tools",
+    "serverUrl": "${env:MCP_SERVER_URL}",
+    "allowedTools": [
+      "lookup_contract",
+      "list_entitlements"
+    ],
+    "requireApproval": "always"
+  },
+  "governance": {
+    "dataEgress": "external",
+    "requiresSecurityReview": true,
+    "allowedEnvironments": [
+      "dev",
+      "test"
+    ]
+  }
+}

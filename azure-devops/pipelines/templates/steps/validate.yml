@@ -1,0 +1,71 @@
+# Offline validation steps. No Azure credentials are used or required.
+# Reused by the validation pipeline and by every deployment pipeline before it touches an environment.
+
+parameters:
+  - name: runTerraformValidate
+    type: boolean
+    default: true
+  - name: installPester
+    type: boolean
+    default: true
+
+steps:
+  - task: PowerShell@2
+    displayName: Report tool versions
+    inputs:
+      pwsh: true
+      targetType: inline
+      script: |
+        Set-StrictMode -Version 3.0
+        $ErrorActionPreference = 'Stop'
+        "PowerShell $($PSVersionTable.PSVersion)"
+        if (Get-Command az -ErrorAction SilentlyContinue) { az version --output tsv 2>$null | Select-Object -First 1 }
+        if (Get-Command terraform -ErrorAction SilentlyContinue) { terraform version }
+
+  - task: PowerShell@2
+    displayName: Install Bicep CLI
+    inputs:
+      pwsh: true
+      targetType: inline
+      script: |
+        Set-StrictMode -Version 3.0
+        $ErrorActionPreference = 'Stop'
+        az bicep install --only-show-errors
+
+  - ${{ if eq(parameters.installPester, true) }}:
+      - task: PowerShell@2
+        displayName: Install Pester 5
+        inputs:
+          pwsh: true
+          targetType: inline
+          script: |
+            Set-StrictMode -Version 3.0
+            $ErrorActionPreference = 'Stop'
+            if (-not (Get-Module -ListAvailable Pester | Where-Object { $_.Version.Major -ge 5 })) {
+              Install-Module Pester -MinimumVersion 5.5.0 -Scope CurrentUser -Force -SkipPublisherCheck
+            }
+
+  - task: PowerShell@2
+    displayName: Offline validation suite
+    inputs:
+      pwsh: true
+      targetType: inline
+      workingDirectory: $(Build.SourcesDirectory)
+      script: |
+        Set-StrictMode -Version 3.0
+        $ErrorActionPreference = 'Stop'
+        $parameters = @{}
+        if ('${{ parameters.runTerraformValidate }}' -ieq 'true') { $parameters['IncludeTerraformValidate'] = $true }
+        ./scripts/Invoke-Validation.ps1 @parameters
+
+  - task: PowerShell@2
+    displayName: Offline evaluator self test
+    inputs:
+      pwsh: true
+      filePath: tests/evaluations/Invoke-EvaluationSuite.ps1
+      arguments: >-
+        -SuitePath ./tests/evaluations/suites/offline-self-test.evaluation.json
+        -Environment dev
+        -AgentName offline-self-test
+        -ResultPath $(Build.ArtifactStagingDirectory)/offline-self-test-result.json
+      workingDirectory: $(Build.SourcesDirectory)

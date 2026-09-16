@@ -1,0 +1,104 @@
+# TEST and UAT promotion. Manual trigger only; the package is never rebuilt.
+#
+# The pipeline resource binds to the DEV pipeline, so the artifact downloaded here is the identical package
+# that was deployed to DEV. Promotion applies the TEST (then UAT) overlay at deploy time.
+#
+# Set up in Azure DevOps before first use:
+#   1. Service connections 'foundry-agents-test' and 'foundry-agents-uat' using workload identity federation.
+#   2. Variable groups 'foundry-agents-test' and 'foundry-agents-uat' with azureSubscriptionId and
+#      azureTenantId.
+#   3. Environments 'foundry-agents-test' and 'foundry-agents-uat', each with an approval check. Add a
+#      business-hours check and an exclusive lock to UAT if your change policy requires them.
+#   4. Set the pipeline resource 'devPipeline' source below to the name of your DEV pipeline.
+
+name: deploy-test-$(Date:yyyyMMdd)$(Rev:.r)
+
+trigger: none
+pr: none
+
+resources:
+  pipelines:
+    - pipeline: devPipeline
+      source: foundry-agents-deploy-dev
+      trigger: none
+
+pool:
+  vmImage: ubuntu-latest
+
+parameters:
+  - name: agentName
+    displayName: Logical agent name
+    type: string
+    default: simple-support-agent
+  - name: agentVersion
+    displayName: Agent version being promoted
+    type: string
+    default: 1.0.0
+  - name: evaluationSuitePath
+    displayName: Evaluation suite path (empty to skip)
+    type: string
+    default: ''
+  - name: promoteToUat
+    displayName: Continue to UAT after TEST succeeds
+    type: boolean
+    default: false
+
+variables:
+  - template: templates/variables/common.yml
+
+stages:
+  - stage: validate
+    displayName: Offline validation
+    jobs:
+      - job: validation
+        displayName: Validate repository
+        timeoutInMinutes: 25
+        steps:
+          - checkout: self
+          - template: templates/steps/validate.yml
+            parameters:
+              runTerraformValidate: false
+              installPester: true
+
+  - template: templates/stages/deploy-stage.yml
+    parameters:
+      stageName: promoteTest
+      displayName: Promote to TEST
+      dependsOn: [validate]
+      environmentName: test
+      azureDevOpsEnvironment: foundry-agents-test
+      serviceConnection: foundry-agents-test
+      variableGroup: foundry-agents-test
+      agentName: ${{ parameters.agentName }}
+      agentVersion: ${{ parameters.agentVersion }}
+      operation: promote
+      sourceEnvironment: dev
+      packageArtifactName: agentPackage
+      sourcePipelineResource: devPipeline
+      runEvaluations: ${{ ne(parameters.evaluationSuitePath, '') }}
+      evaluationSuitePath: ${{ parameters.evaluationSuitePath }}
+      runRegression: true
+      validateSecretReferences: false
+      rollbackOnFailure: true
+
+  - ${{ if eq(parameters.promoteToUat, true) }}:
+      - template: templates/stages/deploy-stage.yml
+        parameters:
+          stageName: promoteUat
+          displayName: Promote to UAT
+          dependsOn: [promoteTest]
+          environmentName: uat
+          azureDevOpsEnvironment: foundry-agents-uat
+          serviceConnection: foundry-agents-uat
+          variableGroup: foundry-agents-uat
+          agentName: ${{ parameters.agentName }}
+          agentVersion: ${{ parameters.agentVersion }}
+          operation: promote
+          sourceEnvironment: test
+          packageArtifactName: agentPackage
+          sourcePipelineResource: devPipeline
+          runEvaluations: ${{ ne(parameters.evaluationSuitePath, '') }}
+          evaluationSuitePath: ${{ parameters.evaluationSuitePath }}
+          runRegression: true
+          validateSecretReferences: true
+          rollbackOnFailure: true

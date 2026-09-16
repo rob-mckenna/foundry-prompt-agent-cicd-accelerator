@@ -1,0 +1,32 @@
+{
+  "$schema": "../../../schemas/environment-overlay.schema.json",
+  "schemaVersion": "1.0.0",
+  "environment": "dev",
+  "model": {
+    "deploymentName": "gpt-4o-mini",
+    "parameters": {
+      "temperature": 0.3
+    }
+  },
+  "toolOverrides": {
+    "knowledge-search": {
+      "config": {
+        "indexName": "kb-dev-v1",
+        "topK": 8
+      }
+    }
+  },
+  "variables": {
+    "SEARCH_CONNECTION_ID": "/subscriptions/${env:AZURE_SUBSCRIPTION_ID}/resourceGroups/rg-foundry-agents-dev/providers/Microsoft.CognitiveServices/accounts/aifagentsdev/projects/proj-agents-dev/connections/kb-search",
+    "SEARCH_INDEX_NAME": "kb-dev-v1",
+    "VECTOR_STORE_ID": "${env:VECTOR_STORE_ID}"
+  },
+  "metadata": {
+    "environment": "dev"
+  },
+  "deploymentGates": {
+    "requireEvaluationPass": false,
+    "requireSmokeTestPass": true,
+    "requireRegressionPass": false
+  }
+}

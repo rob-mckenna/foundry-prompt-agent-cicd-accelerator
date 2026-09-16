@@ -1,0 +1,71 @@
+{
+  "$schema": "../../schemas/environment-config.schema.json",
+  "schemaVersion": "1.0.0",
+  "environment": "test",
+  "displayName": "Integration test",
+  "azure": {
+    "tenantId": "${env:AZURE_TENANT_ID}",
+    "subscriptionId": "${env:AZURE_SUBSCRIPTION_ID}",
+    "resourceGroup": "rg-foundry-agents-test",
+    "location": "eastus2"
+  },
+  "foundry": {
+    "accountName": "aifagentstest",
+    "projectName": "proj-agents-test",
+    "projectEndpoint": "https://aifagentstest.services.ai.azure.com/api/projects/proj-agents-test",
+    "apiVersion": "v1",
+    "tokenScope": "https://ai.azure.com/.default",
+    "defaultModelDeployment": "gpt-4o-mini"
+  },
+  "keyVault": {
+    "name": "kv-fnd-agents-test",
+    "uri": "https://kv-fnd-agents-test.vault.azure.net/"
+  },
+  "runtime": {
+    "allowedVariables": [
+      "AZURE_SUBSCRIPTION_ID",
+      "AZURE_TENANT_ID",
+      "SEARCH_INDEX_NAME",
+      "VECTOR_STORE_ID"
+    ]
+  },
+  "packageStore": {
+    "type": "azureBlob",
+    "accountName": "stfndagentstest",
+    "container": "agent-packages"
+  },
+  "releaseStore": {
+    "type": "azureBlob",
+    "accountName": "stfndagentstest",
+    "container": "agent-releases"
+  },
+  "deployment": {
+    "autoDeploy": false,
+    "approvalRequired": true,
+    "approverGroups": [
+      "agent-platform-approvers"
+    ],
+    "changeWindow": "Business hours. Promotion from DEV only.",
+    "rollbackMode": "redeploy-previous-package"
+  },
+  "governance": {
+    "allowedToolTypes": [
+      "code_interpreter",
+      "file_search",
+      "azure_ai_search",
+      "openapi",
+      "azure_function",
+      "function",
+      "bing_grounding",
+      "mcp"
+    ],
+    "maxDataSensitivity": "confidential",
+    "requireOwnerMetadata": true,
+    "requireResponsibleAiReview": false,
+    "changeRecordPattern": "^[A-Za-z]{2,5}-[0-9]{4,10}$",
+    "requiredMetadataKeys": [
+      "service"
+    ],
+    "maxTemperature": 1.0
+  }
+}

@@ -1,0 +1,243 @@
+# Deploys or promotes one immutable package to one environment.
+#
+# Approval control: the deployment job targets an Azure DevOps Environment. Approvals, business hours checks
+# and branch control configured on that Environment gate the job before any step runs. This template contains
+# no approval logic on purpose, so that the control lives where it can be audited.
+#
+# Authentication: the AzureCLI@2 task uses a workload identity federation service connection. No secret is
+# passed on a command line, set as a pipeline variable or written to a log.
+
+parameters:
+  - name: stageName
+    type: string
+  - name: displayName
+    type: string
+  - name: dependsOn
+    type: object
+    default: []
+  - name: condition
+    type: string
+    default: succeeded()
+  - name: environmentName
+    type: string
+    values: [dev, test, uat, prod]
+  - name: azureDevOpsEnvironment
+    type: string
+  - name: serviceConnection
+    type: string
+  - name: variableGroup
+    type: string
+  - name: agentName
+    type: string
+  - name: agentVersion
+    type: string
+  - name: operation
+    type: string
+    default: deploy
+    values: [deploy, promote]
+  - name: sourceEnvironment
+    type: string
+    default: ''
+  - name: packageArtifactName
+    type: string
+    default: agentPackage
+  - name: sourcePipelineResource
+    type: string
+    default: ''
+  - name: runEvaluations
+    type: boolean
+    default: false
+  - name: evaluationSuitePath
+    type: string
+    default: ''
+  - name: runRegression
+    type: boolean
+    default: false
+  - name: validateSecretReferences
+    type: boolean
+    default: false
+  - name: rollbackOnFailure
+    type: boolean
+    default: true
+  - name: changeRecordId
+    type: string
+    default: ''
+
+stages:
+  - stage: ${{ parameters.stageName }}
+    displayName: ${{ parameters.displayName }}
+    dependsOn: ${{ parameters.dependsOn }}
+    condition: ${{ parameters.condition }}
+    variables:
+      - group: ${{ parameters.variableGroup }}
+    jobs:
+      - deployment: deployAgent
+        displayName: Deploy ${{ parameters.agentName }} to ${{ parameters.environmentName }}
+        environment: ${{ parameters.azureDevOpsEnvironment }}
+        timeoutInMinutes: 60
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+
+                - ${{ if eq(parameters.sourcePipelineResource, '') }}:
+                    - download: current
+                      artifact: ${{ parameters.packageArtifactName }}
+                      displayName: Download immutable package
+                - ${{ if ne(parameters.sourcePipelineResource, '') }}:
+                    - download: ${{ parameters.sourcePipelineResource }}
+                      artifact: ${{ parameters.packageArtifactName }}
+                      displayName: Download promoted package from the source pipeline
+
+                - task: PowerShell@2
+                  name: locatePackage
+                  displayName: Verify package before deployment
+                  inputs:
+                    pwsh: true
+                    targetType: inline
+                    workingDirectory: $(Build.SourcesDirectory)
+                    script: |
+                      Set-StrictMode -Version 3.0
+                      $ErrorActionPreference = 'Stop'
+                      $root = '$(Pipeline.Workspace)'
+                      $package = Get-ChildItem $root -Recurse -Filter '*.zip' -File |
+                        Where-Object { $_.Directory.Name -eq '${{ parameters.packageArtifactName }}' -or $_.FullName -like "*${{ parameters.packageArtifactName }}*" } |
+                        Select-Object -First 1
+                      if (-not $package) { throw "No package artifact named '${{ parameters.packageArtifactName }}' was downloaded to $root." }
+
+                      $result = ./scripts/Test-AgentPackage.ps1 -PackagePath $package.FullName -Environment ${{ parameters.environmentName }}
+                      if ($result.AgentName -ne '${{ parameters.agentName }}') {
+                        throw "Artifact holds agent '$($result.AgentName)' but '${{ parameters.agentName }}' was requested."
+                      }
+                      Write-Host "##vso[task.setvariable variable=packagePath]$($package.FullName)"
+                      Write-Host "##vso[task.setvariable variable=packageId]$($result.PackageId)"
+
+                - task: AzureCLI@2
+                  displayName: Deploy or promote
+                  inputs:
+                    azureSubscription: ${{ parameters.serviceConnection }}
+                    scriptType: pscore
+                    scriptLocation: inlineScript
+                    workingDirectory: $(Build.SourcesDirectory)
+                    inlineScript: |
+                      Set-StrictMode -Version 3.0
+                      $ErrorActionPreference = 'Stop'
+
+                      # Supplied by the variable group. These are identifiers, not secrets.
+                      $env:AZURE_SUBSCRIPTION_ID = '$(azureSubscriptionId)'
+                      $env:AZURE_TENANT_ID = '$(azureTenantId)'
+                      $env:CHANGE_RECORD_ID = '${{ parameters.changeRecordId }}'
+
+                      $gates = @{ validation = 'passed' }
+
+                      if ('${{ parameters.operation }}' -eq 'promote') {
+                        ./scripts/promote-agent.ps1 `
+                          -AgentName '${{ parameters.agentName }}' `
+                          -FromEnvironment '${{ parameters.sourceEnvironment }}' `
+                          -ToEnvironment '${{ parameters.environmentName }}' `
+                          -PackagePath '$(packagePath)' `
+                          -ReleaseDirectory '$(Build.ArtifactStagingDirectory)/releases' `
+                          -GateResult $gates
+                      }
+                      else {
+                        $parameters = @{
+                          PackagePath      = '$(packagePath)'
+                          Environment      = '${{ parameters.environmentName }}'
+                          Operation        = 'deploy'
+                          ReleaseDirectory = '$(Build.ArtifactStagingDirectory)/releases'
+                          GateResult       = $gates
+                        }
+                        if ('${{ parameters.validateSecretReferences }}' -ieq 'true') { $parameters['ValidateSecretReferences'] = $true }
+                        ./scripts/import-agent.ps1 @parameters
+                      }
+
+                - task: AzureCLI@2
+                  displayName: Smoke test
+                  inputs:
+                    azureSubscription: ${{ parameters.serviceConnection }}
+                    scriptType: pscore
+                    scriptLocation: inlineScript
+                    workingDirectory: $(Build.SourcesDirectory)
+                    inlineScript: |
+                      Set-StrictMode -Version 3.0
+                      $ErrorActionPreference = 'Stop'
+                      $env:AZURE_SUBSCRIPTION_ID = '$(azureSubscriptionId)'
+                      $env:AZURE_TENANT_ID = '$(azureTenantId)'
+                      ./tests/smoke/Invoke-SmokeTest.ps1 `
+                        -Environment '${{ parameters.environmentName }}' `
+                        -AgentName '${{ parameters.agentName }}' `
+                        -ExpectedVersion '${{ parameters.agentVersion }}' `
+                        -ResultPath '$(Build.ArtifactStagingDirectory)/releases/smoke-${{ parameters.environmentName }}.json'
+
+                - ${{ if and(eq(parameters.runEvaluations, true), ne(parameters.evaluationSuitePath, '')) }}:
+                    - task: AzureCLI@2
+                      displayName: Evaluations
+                      inputs:
+                        azureSubscription: ${{ parameters.serviceConnection }}
+                        scriptType: pscore
+                        scriptLocation: inlineScript
+                        workingDirectory: $(Build.SourcesDirectory)
+                        inlineScript: |
+                          Set-StrictMode -Version 3.0
+                          $ErrorActionPreference = 'Stop'
+                          $env:AZURE_SUBSCRIPTION_ID = '$(azureSubscriptionId)'
+                          $env:AZURE_TENANT_ID = '$(azureTenantId)'
+                          ./tests/evaluations/Invoke-EvaluationSuite.ps1 `
+                            -SuitePath '${{ parameters.evaluationSuitePath }}' `
+                            -Environment '${{ parameters.environmentName }}' `
+                            -AgentName '${{ parameters.agentName }}' `
+                            -ResultPath '$(Build.ArtifactStagingDirectory)/releases/evaluation-${{ parameters.environmentName }}.json'
+
+                - ${{ if eq(parameters.runRegression, true) }}:
+                    - task: AzureCLI@2
+                      displayName: Regression tests
+                      inputs:
+                        azureSubscription: ${{ parameters.serviceConnection }}
+                        scriptType: pscore
+                        scriptLocation: inlineScript
+                        workingDirectory: $(Build.SourcesDirectory)
+                        inlineScript: |
+                          Set-StrictMode -Version 3.0
+                          $ErrorActionPreference = 'Stop'
+                          $env:AZURE_SUBSCRIPTION_ID = '$(azureSubscriptionId)'
+                          $env:AZURE_TENANT_ID = '$(azureTenantId)'
+                          ./tests/regression/Invoke-RegressionTest.ps1 `
+                            -Environment '${{ parameters.environmentName }}' `
+                            -AgentName '${{ parameters.agentName }}' `
+                            -ResultPath '$(Build.ArtifactStagingDirectory)/releases/regression-${{ parameters.environmentName }}.json'
+
+                - ${{ if eq(parameters.rollbackOnFailure, true) }}:
+                    - task: AzureCLI@2
+                      displayName: Roll back on failure
+                      condition: failed()
+                      inputs:
+                        azureSubscription: ${{ parameters.serviceConnection }}
+                        scriptType: pscore
+                        scriptLocation: inlineScript
+                        workingDirectory: $(Build.SourcesDirectory)
+                        inlineScript: |
+                          Set-StrictMode -Version 3.0
+                          $ErrorActionPreference = 'Continue'
+                          $env:AZURE_SUBSCRIPTION_ID = '$(azureSubscriptionId)'
+                          $env:AZURE_TENANT_ID = '$(azureTenantId)'
+                          Write-Host "##vso[task.logissue type=warning]Deployment or post-deployment testing failed in '${{ parameters.environmentName }}'. Attempting rollback."
+                          try {
+                            ./scripts/Invoke-Rollback.ps1 `
+                              -AgentName '${{ parameters.agentName }}' `
+                              -Environment '${{ parameters.environmentName }}' `
+                              -ArtifactDirectory '$(Pipeline.Workspace)' `
+                              -ReleaseDirectory '$(Build.ArtifactStagingDirectory)/releases' `
+                              -Reason 'Automatic rollback: build $(Build.BuildId) failed.' `
+                              -Confirm:$false
+                          }
+                          catch {
+                            Write-Host "##vso[task.logissue type=error]Automatic rollback failed: $($_.Exception.Message)"
+                            Write-Host "##vso[task.logissue type=error]Follow the manual procedure in docs/deployment-runbook.md."
+                            exit 1
+                          }
+
+                - publish: $(Build.ArtifactStagingDirectory)/releases
+                  artifact: releaseRecords-${{ parameters.environmentName }}-$(Build.BuildId)
+                  displayName: Publish release record and test results
+                  condition: always()

@@ -1,0 +1,79 @@
+name: _reusable-package
+
+# Builds the immutable agent package once. Every environment deploys this exact artifact.
+# No Azure credentials are needed: packaging is a pure local transformation of repository content.
+
+on:
+  workflow_call:
+    inputs:
+      agentPath:
+        description: Path to the agent source folder.
+        type: string
+        required: true
+      artifactName:
+        description: Name of the uploaded artifact.
+        type: string
+        default: agent-package
+      retentionDays:
+        description: Artifact retention. Must exceed your longest promotion window, because promotion and rollback replay this artifact rather than rebuilding it.
+        type: number
+        default: 90
+    outputs:
+      packageId:
+        description: Content address of the built package.
+        value: ${{ jobs.package.outputs.packageId }}
+      packageFile:
+        description: File name of the built package.
+        value: ${{ jobs.package.outputs.packageFile }}
+      agentName:
+        description: Logical agent name.
+        value: ${{ jobs.package.outputs.agentName }}
+      agentVersion:
+        description: Agent version from the manifest.
+        value: ${{ jobs.package.outputs.agentVersion }}
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    name: Build immutable package
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      packageId: ${{ steps.build.outputs.packageId }}
+      packageFile: ${{ steps.build.outputs.packageFile }}
+      agentName: ${{ steps.build.outputs.agentName }}
+      agentVersion: ${{ steps.build.outputs.agentVersion }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Build package
+        id: build
+        shell: pwsh
+        env:
+          AGENT_PATH: ${{ inputs.agentPath }}
+        run: |
+          Set-StrictMode -Version 3.0
+          $ErrorActionPreference = 'Stop'
+          $result = ./scripts/New-AgentPackage.ps1 -AgentPath $env:AGENT_PATH -OutputDirectory ./out -SourceCommit $env:GITHUB_SHA
+          "packageId=$($result.PackageId)"       | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "packageFile=$(Split-Path -Leaf $result.PackagePath)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "agentName=$($result.AgentName)"       | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "agentVersion=$($result.Version)"      | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Verify package integrity
+        shell: pwsh
+        run: |
+          Set-StrictMode -Version 3.0
+          $ErrorActionPreference = 'Stop'
+          ./scripts/Test-AgentPackage.ps1 -PackagePath "./out/${{ steps.build.outputs.packageFile }}"
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifactName }}
+          path: out/*.zip
+          if-no-files-found: error
+          retention-days: ${{ inputs.retentionDays }}

@@ -1,0 +1,20 @@
+{
+  "$schema": "../../schemas/tool-definition.schema.json",
+  "schemaVersion": "1.0.0",
+  "id": "orders-api",
+  "type": "openapi",
+  "displayName": "Orders API",
+  "description": "Reads order status from the line-of-business orders service.",
+  "config": {
+    "name": "orders_api",
+    "specFile": "orders-api.openapi.json",
+    "auth": {
+      "type": "connection",
+      "connectionId": "${env:ORDERS_API_CONNECTION_ID}"
+    }
+  },
+  "governance": {
+    "dataEgress": "internal",
+    "requiresSecurityReview": true
+  }
+}

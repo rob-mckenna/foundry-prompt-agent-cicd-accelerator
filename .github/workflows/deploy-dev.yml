@@ -1,0 +1,92 @@
+name: deploy-dev
+
+# DEV is the only environment that deploys automatically. Every merge to main that touches the agent source
+# validates, packages once and deploys that package to DEV.
+#
+# Set up in GitHub before first use:
+#   1. Environment 'dev' with variables AZURE_CLIENT_ID, AZURE_TENANT_ID, AZURE_SUBSCRIPTION_ID.
+#      No required reviewers: DEV is intentionally unattended.
+#   2. A federated credential on the app registration for
+#      repo:<owner>/<repo>:environment:dev
+#   3. Branch protection on main requiring the validate workflow.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'samples/**'
+      - 'agents/**'
+      - 'config/environments/dev.json'
+      - 'schemas/**'
+      - 'scripts/**'
+      - 'tests/**'
+      - '.github/workflows/deploy-dev.yml'
+      - '.github/workflows/_reusable-*.yml'
+  workflow_dispatch:
+    inputs:
+      agentPath:
+        description: Agent source folder to deploy.
+        type: string
+        required: true
+        default: samples/simple-agent
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-dev-${{ inputs.agentPath || 'samples/simple-agent' }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: Validate
+    uses: ./.github/workflows/_reusable-validate.yml
+    with:
+      runTerraformValidate: false
+      installPester: true
+
+  package:
+    name: Package
+    needs: validate
+    uses: ./.github/workflows/_reusable-package.yml
+    with:
+      agentPath: ${{ inputs.agentPath || 'samples/simple-agent' }}
+      artifactName: agent-package
+      retentionDays: 90
+
+  deploy:
+    name: Deploy to DEV
+    needs: package
+    uses: ./.github/workflows/_reusable-deploy.yml
+    with:
+      environment: dev
+      targetEnvironment: dev
+      agentName: ${{ needs.package.outputs.agentName }}
+      agentVersion: ${{ needs.package.outputs.agentVersion }}
+      artifactName: agent-package
+      packageFile: ${{ needs.package.outputs.packageFile }}
+      operation: deploy
+      runEvaluations: false
+      runRegression: false
+      validateSecretReferences: false
+
+  summary:
+    name: Record package identity
+    needs: [package, deploy]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Publish package identity
+        shell: bash
+        run: |
+          {
+            echo "### DEV deployment complete"
+            echo ""
+            echo "| Field | Value |"
+            echo "| --- | --- |"
+            echo "| Agent | \`${{ needs.package.outputs.agentName }}\` |"
+            echo "| Version | \`${{ needs.package.outputs.agentVersion }}\` |"
+            echo "| Package id | \`${{ needs.package.outputs.packageId }}\` |"
+            echo "| Artifact | \`${{ needs.package.outputs.packageFile }}\` |"
+            echo ""
+            echo "Promote this exact package with the deploy-test workflow. Do not rebuild."
+          } >> "$GITHUB_STEP_SUMMARY"

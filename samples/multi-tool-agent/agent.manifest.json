@@ -1,0 +1,60 @@
+{
+  "$schema": "../../schemas/agent-manifest.schema.json",
+  "schemaVersion": "1.0.0",
+  "name": "operations-copilot",
+  "version": "2.1.0",
+  "displayName": "Operations Copilot",
+  "description": "Assists operations staff with order status, entitlement checks and knowledge lookups across line-of-business systems.",
+  "owner": {
+    "team": "operations-engineering",
+    "contact": "ops-engineering@contoso.example.com",
+    "costCenter": "OPS-3390",
+    "supportUrl": "https://contoso.example.com/runbooks/operations-copilot"
+  },
+  "classification": {
+    "dataSensitivity": "confidential",
+    "businessCriticality": "high",
+    "processesPersonalData": true,
+    "humanInTheLoop": true,
+    "responsibleAiReviewId": "RAI-2026-0304"
+  },
+  "model": {
+    "deploymentName": "gpt-4o",
+    "modelFamily": "gpt-4o",
+    "parameters": {
+      "temperature": 0.2,
+      "topP": 0.9
+    },
+    "responseFormat": {
+      "type": "text"
+    }
+  },
+  "instructions": {
+    "file": "instructions.md"
+  },
+  "tools": [
+    {
+      "ref": "tools/knowledge-search.json"
+    },
+    {
+      "ref": "tools/orders-api.json"
+    },
+    {
+      "ref": "tools/entitlement-check.json"
+    },
+    {
+      "ref": "tools/code-interpreter.json"
+    },
+    {
+      "ref": "tools/web-grounding.json"
+    }
+  ],
+  "evaluations": {
+    "suiteFile": "evaluations/operations.evaluation.json",
+    "required": true
+  },
+  "metadata": {
+    "service": "operations",
+    "pattern": "multi-tool-agent"
+  }
+}

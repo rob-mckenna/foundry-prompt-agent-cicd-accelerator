@@ -1,0 +1,42 @@
+{
+  "$schema": "../../../schemas/tool-definition.schema.json",
+  "schemaVersion": "1.0.0",
+  "id": "entitlement-check",
+  "type": "azure_function",
+  "displayName": "Entitlement check",
+  "description": "Verifies whether a customer is entitled to a chargeable product or service.",
+  "config": {
+    "name": "check_entitlement",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "customerId": {
+          "type": "string",
+          "description": "Contoso customer identifier."
+        },
+        "productCode": {
+          "type": "string",
+          "description": "Product or service code to check."
+        }
+      },
+      "required": [
+        "customerId",
+        "productCode"
+      ],
+      "additionalProperties": false
+    },
+    "inputQueue": {
+      "storageServiceEndpoint": "${env:FUNCTION_QUEUE_ENDPOINT}",
+      "queueName": "entitlement-input"
+    },
+    "outputQueue": {
+      "storageServiceEndpoint": "${env:FUNCTION_QUEUE_ENDPOINT}",
+      "queueName": "entitlement-output"
+    }
+  },
+  "governance": {
+    "dataEgress": "internal",
+    "requiresSecurityReview": true,
+    "networkIsolationRequired": true
+  }
+}

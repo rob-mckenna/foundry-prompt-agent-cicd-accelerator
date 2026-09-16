@@ -1,0 +1,17 @@
+{
+  "$schema": "../../../schemas/tool-definition.schema.json",
+  "schemaVersion": "1.0.0",
+  "id": "code-interpreter",
+  "type": "code_interpreter",
+  "displayName": "Code interpreter",
+  "description": "Sandboxed Python for arithmetic, date maths and parsing data already present in the conversation.",
+  "config": {},
+  "governance": {
+    "dataEgress": "none",
+    "requiresSecurityReview": true,
+    "allowedEnvironments": [
+      "dev",
+      "test"
+    ]
+  }
+}

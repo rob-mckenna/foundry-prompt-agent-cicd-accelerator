@@ -1,0 +1,51 @@
+{
+  "$schema": "../../schemas/agent-manifest.schema.json",
+  "schemaVersion": "1.0.0",
+  "name": "kb-research-agent",
+  "version": "1.4.0",
+  "displayName": "Knowledge Base Research Agent",
+  "description": "Answers policy and product questions using the enterprise knowledge index and documents uploaded to the project.",
+  "owner": {
+    "team": "knowledge-services",
+    "contact": "knowledge-services@contoso.example.com",
+    "costCenter": "KS-2210",
+    "supportUrl": "https://contoso.example.com/runbooks/kb-research-agent"
+  },
+  "classification": {
+    "dataSensitivity": "internal",
+    "businessCriticality": "high",
+    "processesPersonalData": false,
+    "humanInTheLoop": false,
+    "responsibleAiReviewId": "RAI-2026-0231"
+  },
+  "model": {
+    "deploymentName": "gpt-4o-mini",
+    "modelFamily": "gpt-4o",
+    "parameters": {
+      "temperature": 0.2,
+      "topP": 0.9
+    },
+    "responseFormat": {
+      "type": "text"
+    }
+  },
+  "instructions": {
+    "file": "instructions.md"
+  },
+  "tools": [
+    {
+      "ref": "tools/knowledge-search.json"
+    },
+    {
+      "ref": "tools/uploaded-documents.json"
+    }
+  ],
+  "evaluations": {
+    "suiteFile": "evaluations/grounding.evaluation.json",
+    "required": true
+  },
+  "metadata": {
+    "service": "knowledge-services",
+    "pattern": "rag-agent"
+  }
+}

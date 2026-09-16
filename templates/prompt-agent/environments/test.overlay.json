@@ -1,0 +1,21 @@
+{
+  "$schema": "../../../schemas/environment-overlay.schema.json",
+  "schemaVersion": "1.0.0",
+  "environment": "test",
+  "model": {
+    "deploymentName": "gpt-4o-mini",
+    "parameters": {
+      "temperature": 0.2
+    }
+  },
+  "variables": {},
+  "metadata": {
+    "environment": "test"
+  },
+  "deploymentGates": {
+    "requireEvaluationPass": true,
+    "requireSmokeTestPass": true,
+    "requireRegressionPass": true,
+    "minimumEvaluationScore": 0.85
+  }
+}

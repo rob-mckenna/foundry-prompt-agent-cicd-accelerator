@@ -1,0 +1,17 @@
+{
+  "$schema": "../../schemas/tool-definition.schema.json",
+  "schemaVersion": "1.0.0",
+  "id": "code-interpreter",
+  "type": "code_interpreter",
+  "displayName": "Code interpreter",
+  "description": "Runs sandboxed Python for calculations, parsing and chart generation.",
+  "config": {},
+  "governance": {
+    "dataEgress": "none",
+    "requiresSecurityReview": true,
+    "allowedEnvironments": [
+      "dev",
+      "test"
+    ]
+  }
+}

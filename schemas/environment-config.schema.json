@@ -1,0 +1,126 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/foundry-prompt-agent-cicd-accelerator/schemas/environment-config.schema.json",
+  "title": "Target Environment Configuration",
+  "description": "Describes one deployment target (DEV, TEST, UAT, PROD). Contains resource names and policy only. Secrets are referenced through Key Vault and never stored here.",
+  "type": "object",
+  "required": ["schemaVersion", "environment", "azure", "foundry", "runtime", "deployment", "governance"],
+  "additionalProperties": false,
+  "properties": {
+    "$schema": { "type": "string" },
+    "schemaVersion": { "const": "1.0.0" },
+    "environment": { "enum": ["dev", "test", "uat", "prod"] },
+    "displayName": { "type": "string" },
+    "azure": {
+      "type": "object",
+      "required": ["subscriptionId", "resourceGroup", "location"],
+      "additionalProperties": false,
+      "properties": {
+        "tenantId": { "type": "string", "description": "Tenant GUID or ${env:AZURE_TENANT_ID}." },
+        "subscriptionId": { "type": "string", "description": "Subscription GUID or ${env:AZURE_SUBSCRIPTION_ID}." },
+        "resourceGroup": { "type": "string", "minLength": 1 },
+        "location": { "type": "string", "minLength": 1 }
+      }
+    },
+    "foundry": {
+      "type": "object",
+      "required": ["accountName", "projectName", "projectEndpoint", "apiVersion", "tokenScope"],
+      "additionalProperties": false,
+      "properties": {
+        "accountName": { "type": "string", "minLength": 2, "maxLength": 64 },
+        "projectName": { "type": "string", "minLength": 2, "maxLength": 64 },
+        "projectEndpoint": {
+          "type": "string",
+          "pattern": "^https://[^/]+/api/projects/[^/]+/?$",
+          "description": "Agent Service data plane endpoint, for example https://<account>.services.ai.azure.com/api/projects/<project>."
+        },
+        "apiVersion": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Agent Service data plane api-version. Pin explicitly and verify with scripts/Invoke-Validation.ps1 -CheckEndpoints."
+        },
+        "tokenScope": {
+          "type": "string",
+          "minLength": 1,
+          "description": "AAD scope requested for data plane calls, normally https://ai.azure.com/.default."
+        },
+        "defaultModelDeployment": { "type": "string" }
+      }
+    },
+    "keyVault": {
+      "type": "object",
+      "required": ["name"],
+      "additionalProperties": false,
+      "properties": {
+        "name": { "type": "string", "pattern": "^[A-Za-z0-9-]{3,24}$" },
+        "uri": { "type": "string" }
+      }
+    },
+    "runtime": {
+      "type": "object",
+      "required": ["allowedVariables"],
+      "additionalProperties": false,
+      "description": "Closed allowlist of ${env:NAME} placeholders that may be bound at deploy time. Nothing outside this list is ever read from the process environment, so a package cannot exfiltrate CI secrets.",
+      "properties": {
+        "allowedVariables": {
+          "type": "array",
+          "items": { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$" },
+          "description": "Names must be non-secret identifiers. Names resembling credentials are rejected at load time; use overlay secretRefs for secrets."
+        }
+      }
+    },
+    "packageStore": {
+      "type": "object",
+      "required": ["type"],
+      "additionalProperties": false,
+      "description": "Durable, content-addressed store for immutable packages. Required for rollback that outlives pipeline artifact retention.",
+      "properties": {
+        "type": { "enum": ["azureBlob", "none"] },
+        "accountName": { "type": "string" },
+        "container": { "type": "string" }
+      }
+    },
+    "releaseStore": {
+      "type": "object",
+      "required": ["type"],
+      "additionalProperties": false,
+      "properties": {
+        "type": { "enum": ["azureBlob", "local"] },
+        "accountName": { "type": "string" },
+        "container": { "type": "string" },
+        "path": { "type": "string", "description": "Used when type is local. Relative paths resolve against the repository root." }
+      }
+    },
+    "deployment": {
+      "type": "object",
+      "required": ["autoDeploy", "approvalRequired"],
+      "additionalProperties": false,
+      "properties": {
+        "autoDeploy": { "type": "boolean", "description": "True only for DEV in the reference design." },
+        "approvalRequired": { "type": "boolean" },
+        "approverGroups": { "type": "array", "items": { "type": "string" } },
+        "changeWindow": { "type": "string", "description": "Informational description of the permitted deployment window." },
+        "rollbackMode": { "enum": ["redeploy-previous-package", "manual"], "default": "redeploy-previous-package" }
+      }
+    },
+    "governance": {
+      "type": "object",
+      "required": ["allowedToolTypes", "maxDataSensitivity"],
+      "additionalProperties": false,
+      "properties": {
+        "allowedToolTypes": {
+          "type": "array",
+          "items": {
+            "enum": ["code_interpreter", "file_search", "azure_ai_search", "openapi", "azure_function", "function", "bing_grounding", "mcp"]
+          }
+        },
+        "maxDataSensitivity": { "enum": ["public", "internal", "confidential", "highly-confidential"] },
+        "requireOwnerMetadata": { "type": "boolean", "default": true },
+        "requireResponsibleAiReview": { "type": "boolean", "default": false },
+        "requiredMetadataKeys": { "type": "array", "items": { "type": "string" } },
+        "maxTemperature": { "type": "number", "minimum": 0, "maximum": 2 },
+        "changeRecordPattern": { "type": "string", "description": "Regular expression a change_record metadata value must match. Placeholder ids whose numeric part is all zeros are rejected regardless." }
+      }
+    }
+  }
+}

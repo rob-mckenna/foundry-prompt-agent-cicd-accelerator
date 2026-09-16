@@ -1,0 +1,80 @@
+name: validate
+
+# Pull request and push validation. Fully offline: no Azure credentials, no secrets, no deployment.
+# Make this a required status check on main in branch protection.
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: validate-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  offline-validation:
+    name: Offline validation
+    uses: ./.github/workflows/_reusable-validate.yml
+    with:
+      runTerraformValidate: true
+      installPester: true
+
+  package-samples:
+    name: Package samples
+    needs: offline-validation
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        sample: [simple-agent, rag-agent, multi-tool-agent]
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Build and verify the package
+        shell: pwsh
+        run: |
+          Set-StrictMode -Version 3.0
+          $ErrorActionPreference = 'Stop'
+          $result = ./scripts/New-AgentPackage.ps1 -AgentPath ./samples/${{ matrix.sample }} -OutputDirectory ./out -SourceCommit $env:GITHUB_SHA
+          ./scripts/Test-AgentPackage.ps1 -PackagePath $result.PackagePath
+
+      - name: Confirm the build is reproducible
+        shell: pwsh
+        run: |
+          Set-StrictMode -Version 3.0
+          $ErrorActionPreference = 'Stop'
+          # Building the same source twice must yield the same content address. If this fails, something
+          # non-deterministic leaked into the package and promotion guarantees no longer hold.
+          $first = ./scripts/New-AgentPackage.ps1 -AgentPath ./samples/${{ matrix.sample }} -OutputDirectory ./out/a -SourceCommit $env:GITHUB_SHA
+          $second = ./scripts/New-AgentPackage.ps1 -AgentPath ./samples/${{ matrix.sample }} -OutputDirectory ./out/b -SourceCommit $env:GITHUB_SHA
+          if ($first.PackageId -ne $second.PackageId) {
+            throw "Package build is not reproducible: $($first.PackageId) vs $($second.PackageId)."
+          }
+          Write-Host "Reproducible content address: $($first.PackageId)"
+
+      - name: Show the resolved payload for every environment
+        shell: pwsh
+        env:
+          # Placeholder identifiers only. -WhatIf never requests a token, so these are never used to
+          # authenticate; they exist so that placeholder expansion can complete.
+          AZURE_SUBSCRIPTION_ID: 00000000-0000-0000-0000-000000000000
+          AZURE_TENANT_ID: 11111111-1111-1111-1111-111111111111
+          VECTOR_STORE_ID: vs_placeholder
+          BING_CONNECTION_ID: placeholder
+        run: |
+          Set-StrictMode -Version 3.0
+          $ErrorActionPreference = 'Stop'
+          # -WhatIf returns before any credential is requested, so this stays credential free.
+          foreach ($environment in @('dev', 'test', 'uat', 'prod')) {
+            Write-Host "::group::${{ matrix.sample }} -> $environment"
+            ./scripts/import-agent.ps1 -PackagePath (Get-ChildItem ./out/*.zip | Select-Object -First 1).FullName -Environment $environment -WhatIf
+            Write-Host '::endgroup::'
+          }

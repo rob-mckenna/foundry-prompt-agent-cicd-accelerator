@@ -1,0 +1,72 @@
+{
+  "$schema": "../../schemas/environment-config.schema.json",
+  "schemaVersion": "1.0.0",
+  "environment": "prod",
+  "displayName": "Production",
+  "azure": {
+    "tenantId": "${env:AZURE_TENANT_ID}",
+    "subscriptionId": "${env:AZURE_SUBSCRIPTION_ID}",
+    "resourceGroup": "rg-foundry-agents-prod",
+    "location": "eastus2"
+  },
+  "foundry": {
+    "accountName": "aifagentsprod",
+    "projectName": "proj-agents-prod",
+    "projectEndpoint": "https://aifagentsprod.services.ai.azure.com/api/projects/proj-agents-prod",
+    "apiVersion": "v1",
+    "tokenScope": "https://ai.azure.com/.default",
+    "defaultModelDeployment": "gpt-4o"
+  },
+  "keyVault": {
+    "name": "kv-fnd-agents-prod",
+    "uri": "https://kv-fnd-agents-prod.vault.azure.net/"
+  },
+  "runtime": {
+    "allowedVariables": [
+      "AZURE_SUBSCRIPTION_ID",
+      "AZURE_TENANT_ID",
+      "SEARCH_INDEX_NAME",
+      "VECTOR_STORE_ID",
+      "CHANGE_RECORD_ID"
+    ]
+  },
+  "packageStore": {
+    "type": "azureBlob",
+    "accountName": "stfndagentsprod",
+    "container": "agent-packages"
+  },
+  "releaseStore": {
+    "type": "azureBlob",
+    "accountName": "stfndagentsprod",
+    "container": "agent-releases"
+  },
+  "deployment": {
+    "autoDeploy": false,
+    "approvalRequired": true,
+    "approverGroups": [
+      "agent-platform-approvers",
+      "service-owners",
+      "change-advisory-board"
+    ],
+    "changeWindow": "Approved change window only. Promotion from UAT with a linked change record.",
+    "rollbackMode": "redeploy-previous-package"
+  },
+  "governance": {
+    "allowedToolTypes": [
+      "file_search",
+      "azure_ai_search",
+      "openapi",
+      "azure_function",
+      "function"
+    ],
+    "maxDataSensitivity": "confidential",
+    "requireOwnerMetadata": true,
+    "requireResponsibleAiReview": true,
+    "changeRecordPattern": "^[A-Za-z]{2,5}-[0-9]{4,10}$",
+    "requiredMetadataKeys": [
+      "service",
+      "change_record"
+    ],
+    "maxTemperature": 0.5
+  }
+}

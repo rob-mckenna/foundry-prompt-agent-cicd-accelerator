@@ -1,0 +1,73 @@
+{
+  "$schema": "../../../schemas/evaluation-suite.schema.json",
+  "schemaVersion": "1.0.0",
+  "id": "offline-self-test",
+  "displayName": "Offline evaluator self test",
+  "description": "Exercises every deterministic evaluator against recorded responses. Runs in pull request validation with no Azure access, so a change to the evaluator logic is caught before it reaches a gate.",
+  "appliesTo": [
+    "dev",
+    "test",
+    "uat",
+    "prod"
+  ],
+  "dataset": {
+    "file": "offline-self-test.dataset.jsonl",
+    "format": "jsonl",
+    "inputField": "query",
+    "expectedField": "expected"
+  },
+  "evaluators": [
+    {
+      "name": "required-terms",
+      "type": "contains-all",
+      "field": "output",
+      "arguments": {
+        "fromExpectedField": "mustContain",
+        "caseSensitive": false
+      },
+      "weight": 1
+    },
+    {
+      "name": "no-leakage",
+      "type": "not-contains",
+      "field": "output",
+      "arguments": {
+        "values": [
+          "system prompt",
+          "connection id"
+        ],
+        "caseSensitive": false
+      },
+      "weight": 1
+    },
+    {
+      "name": "cites-a-source",
+      "type": "regex-match",
+      "field": "output",
+      "arguments": {
+        "pattern": "(?i)sources?\\s*:",
+        "appliesWhenExpectedField": "requiresCitation"
+      },
+      "weight": 1
+    },
+    {
+      "name": "response-latency",
+      "type": "latency",
+      "arguments": {
+        "maximumMs": 20000
+      },
+      "weight": 1
+    }
+  ],
+  "thresholds": {
+    "minimumPassRate": 1.0,
+    "maximumP95LatencyMs": 20000,
+    "maximumFailures": 0
+  },
+  "execution": {
+    "mode": "offline-fixture",
+    "fixtureFile": "offline-self-test.fixture.jsonl",
+    "maxParallel": 1,
+    "timeoutSeconds": 30
+  }
+}

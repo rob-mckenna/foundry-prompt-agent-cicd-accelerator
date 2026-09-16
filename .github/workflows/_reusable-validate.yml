@@ -1,0 +1,82 @@
+name: _reusable-validate
+
+# Offline validation. Runs with no Azure credentials and no secrets of any kind.
+# Called by validate.yml on pull requests and by every deploy workflow before it touches an environment.
+
+on:
+  workflow_call:
+    inputs:
+      runsOn:
+        description: Runner label.
+        type: string
+        default: ubuntu-latest
+      runTerraformValidate:
+        description: Run terraform init -backend=false and terraform validate. Needs network access for provider download.
+        type: boolean
+        default: true
+      installPester:
+        description: Install Pester 5 into the runner user scope so the unit tests execute.
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Offline validation
+    runs-on: ${{ inputs.runsOn }}
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Bicep CLI
+        run: az bicep install --only-show-errors
+        shell: bash
+
+      - name: Set up Terraform
+        if: inputs.runTerraformValidate
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.13.5
+          terraform_wrapper: false
+
+      - name: Install Pester 5
+        if: inputs.installPester
+        shell: pwsh
+        run: |
+          Set-StrictMode -Version 3.0
+          $ErrorActionPreference = 'Stop'
+          if (-not (Get-Module -ListAvailable Pester | Where-Object { $_.Version.Major -ge 5 })) {
+            Install-Module Pester -MinimumVersion 5.5.0 -Scope CurrentUser -Force -SkipPublisherCheck
+          }
+
+      - name: Run offline validation suite
+        shell: pwsh
+        run: |
+          Set-StrictMode -Version 3.0
+          $ErrorActionPreference = 'Stop'
+          $parameters = @{}
+          if ('${{ inputs.runTerraformValidate }}' -eq 'true') { $parameters['IncludeTerraformValidate'] = $true }
+          ./scripts/Invoke-Validation.ps1 @parameters
+
+      - name: Run offline evaluator self test
+        shell: pwsh
+        run: |
+          Set-StrictMode -Version 3.0
+          $ErrorActionPreference = 'Stop'
+          ./tests/evaluations/Invoke-EvaluationSuite.ps1 `
+            -SuitePath ./tests/evaluations/suites/offline-self-test.evaluation.json `
+            -Environment dev `
+            -AgentName offline-self-test `
+            -ResultPath ./out/offline-self-test-result.json
+
+      - name: Upload validation artefacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: validation-results
+          path: out/
+          if-no-files-found: ignore
+          retention-days: 14

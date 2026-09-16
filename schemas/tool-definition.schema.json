@@ -1,0 +1,202 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/foundry-prompt-agent-cicd-accelerator/schemas/tool-definition.schema.json",
+  "title": "Foundry Agent Tool Definition",
+  "description": "Environment-neutral tool definition. Connection identifiers, index names and endpoints are supplied through ${env:VAR} placeholders or environment overlays so that one package can be promoted unchanged.",
+  "type": "object",
+  "required": ["schemaVersion", "id", "type"],
+  "additionalProperties": false,
+  "properties": {
+    "$schema": { "type": "string" },
+    "schemaVersion": { "const": "1.0.0" },
+    "id": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9-]{1,62}$",
+      "description": "Stable tool identifier used by environment overlays for targeted overrides."
+    },
+    "type": {
+      "enum": [
+        "code_interpreter",
+        "file_search",
+        "azure_ai_search",
+        "openapi",
+        "azure_function",
+        "function",
+        "bing_grounding",
+        "mcp"
+      ],
+      "description": "Agent Service tool type. Verify availability in the target region and API version before enabling."
+    },
+    "displayName": { "type": "string", "maxLength": 128 },
+    "description": { "type": "string", "maxLength": 1024 },
+    "config": {
+      "type": "object",
+      "description": "Type-specific configuration. See docs/deployment-patterns.md for the mapping to Agent Service payload fields.",
+      "additionalProperties": true
+    },
+    "governance": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "dataEgress": {
+          "enum": ["none", "internal", "external"],
+          "description": "Whether the tool can send prompt content outside the Azure tenant boundary."
+        },
+        "requiresSecurityReview": { "type": "boolean", "default": false },
+        "allowedEnvironments": {
+          "type": "array",
+          "items": { "enum": ["dev", "test", "uat", "prod"] },
+          "description": "When present, deployment to an environment not in this list fails the governance gate."
+        },
+        "networkIsolationRequired": { "type": "boolean", "default": false }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "type": { "const": "azure_ai_search" } }, "required": ["type"] },
+      "then": {
+        "properties": {
+          "config": {
+            "type": "object",
+            "required": ["connectionId", "indexName"],
+            "properties": {
+              "connectionId": { "type": "string", "minLength": 1, "description": "Foundry project connection id for Azure AI Search. Use ${env:...} so each environment binds its own connection." },
+              "indexName": { "type": "string", "minLength": 1 },
+              "queryType": { "enum": ["simple", "semantic", "vector", "vector_simple_hybrid", "vector_semantic_hybrid"] },
+              "topK": { "type": "integer", "minimum": 1, "maximum": 50 },
+              "filter": { "type": "string" }
+            }
+          }
+        },
+        "required": ["config"]
+      }
+    },
+    {
+      "if": { "properties": { "type": { "const": "openapi" } }, "required": ["type"] },
+      "then": {
+        "properties": {
+          "config": {
+            "type": "object",
+            "required": ["name", "specFile", "auth"],
+            "properties": {
+              "name": { "type": "string", "pattern": "^[a-zA-Z0-9_-]{1,64}$" },
+              "specFile": { "type": "string", "description": "Path, relative to the tool definition, of the OpenAPI 3 document packaged with the agent." },
+              "auth": {
+                "type": "object",
+                "required": ["type"],
+                "properties": {
+                  "type": { "enum": ["anonymous", "connection", "managed_identity"] },
+                  "connectionId": { "type": "string", "description": "Required when type is connection. Never embed a key here." },
+                  "audience": { "type": "string", "description": "Required when type is managed_identity." }
+                }
+              }
+            }
+          }
+        },
+        "required": ["config"]
+      }
+    },
+    {
+      "if": { "properties": { "type": { "const": "function" } }, "required": ["type"] },
+      "then": {
+        "properties": {
+          "config": {
+            "type": "object",
+            "required": ["name", "parameters"],
+            "properties": {
+              "name": { "type": "string", "pattern": "^[a-zA-Z0-9_-]{1,64}$" },
+              "parameters": { "type": "object", "description": "JSON Schema object describing the function arguments." }
+            }
+          }
+        },
+        "required": ["config"]
+      }
+    },
+    {
+      "if": { "properties": { "type": { "const": "azure_function" } }, "required": ["type"] },
+      "then": {
+        "properties": {
+          "config": {
+            "type": "object",
+            "required": ["name", "parameters", "inputQueue", "outputQueue"],
+            "properties": {
+              "name": { "type": "string", "pattern": "^[a-zA-Z0-9_-]{1,64}$" },
+              "parameters": { "type": "object" },
+              "inputQueue": { "$ref": "#/definitions/storageQueue" },
+              "outputQueue": { "$ref": "#/definitions/storageQueue" }
+            }
+          }
+        },
+        "required": ["config"]
+      }
+    },
+    {
+      "if": { "properties": { "type": { "const": "mcp" } }, "required": ["type"] },
+      "then": {
+        "properties": {
+          "config": {
+            "type": "object",
+            "required": ["serverLabel", "serverUrl"],
+            "properties": {
+              "serverLabel": { "type": "string", "pattern": "^[a-zA-Z0-9_-]{1,64}$" },
+              "serverUrl": { "type": "string", "description": "HTTPS MCP endpoint. Use ${env:...} to bind per environment." },
+              "allowedTools": { "type": "array", "items": { "type": "string" } },
+              "requireApproval": { "enum": ["always", "never"], "default": "always" }
+            }
+          }
+        },
+        "required": ["config"]
+      }
+    },
+    {
+      "if": { "properties": { "type": { "const": "bing_grounding" } }, "required": ["type"] },
+      "then": {
+        "properties": {
+          "config": {
+            "type": "object",
+            "required": ["connectionId"],
+            "properties": {
+              "connectionId": { "type": "string", "minLength": 1 },
+              "count": { "type": "integer", "minimum": 1, "maximum": 50 },
+              "market": { "type": "string" },
+              "setLang": { "type": "string" }
+            }
+          }
+        },
+        "required": ["config"]
+      }
+    },
+    {
+      "if": { "properties": { "type": { "const": "file_search" } }, "required": ["type"] },
+      "then": {
+        "properties": {
+          "config": {
+            "type": "object",
+            "required": ["vectorStoreIds"],
+            "properties": {
+              "vectorStoreIds": {
+                "type": "array",
+                "minItems": 1,
+                "items": { "type": "string" },
+                "description": "Vector store identifiers created in the target project. Bind per environment with ${env:...}."
+              }
+            }
+          }
+        },
+        "required": ["config"]
+      }
+    }
+  ],
+  "definitions": {
+    "storageQueue": {
+      "type": "object",
+      "required": ["storageServiceEndpoint", "queueName"],
+      "additionalProperties": false,
+      "properties": {
+        "storageServiceEndpoint": { "type": "string", "description": "Queue service endpoint, for example https://<account>.queue.core.windows.net. Never include a SAS token." },
+        "queueName": { "type": "string", "minLength": 1 }
+      }
+    }
+  }
+}

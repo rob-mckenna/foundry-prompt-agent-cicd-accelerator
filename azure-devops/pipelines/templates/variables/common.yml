@@ -1,0 +1,22 @@
+# Shared variables for every pipeline in this repository.
+# Nothing here is a secret. Environment specific identifiers come from the variable group referenced by each
+# pipeline, and credentials come from the workload identity federation service connection.
+
+variables:
+  - name: vmImageName
+    value: ubuntu-latest
+
+  - name: pwshVersionRequired
+    value: '7.2'
+
+  # Retain packages for longer than the longest promotion window. Promotion and rollback replay this
+  # artifact; they never rebuild.
+  - name: packageArtifactName
+    value: agentPackage
+
+  - name: releaseArtifactName
+    value: releaseRecords
+
+  # Terraform provider download needs network access, which build agents have.
+  - name: runTerraformValidate
+    value: 'true'

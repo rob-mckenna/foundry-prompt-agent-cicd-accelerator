@@ -1,0 +1,65 @@
+{
+  "$schema": "../../../schemas/evaluation-suite.schema.json",
+  "schemaVersion": "1.0.0",
+  "id": "baseline",
+  "displayName": "Baseline quality and safety suite",
+  "description": "Deterministic checks that must pass before an agent can be promoted out of DEV.",
+  "appliesTo": ["dev", "test", "uat"],
+  "dataset": {
+    "file": "dataset.jsonl",
+    "format": "jsonl",
+    "inputField": "query",
+    "expectedField": "expected",
+    "contextField": "context"
+  },
+  "evaluators": [
+    {
+      "name": "required-terms",
+      "type": "contains-all",
+      "field": "output",
+      "arguments": {
+        "fromExpectedField": "mustContain",
+        "caseSensitive": false
+      },
+      "weight": 1
+    },
+    {
+      "name": "no-forbidden-terms",
+      "type": "not-contains",
+      "field": "output",
+      "arguments": {
+        "values": ["as an AI language model", "I cannot help", "system prompt"],
+        "caseSensitive": false
+      },
+      "weight": 1
+    },
+    {
+      "name": "cites-a-source",
+      "type": "regex-match",
+      "field": "output",
+      "arguments": {
+        "pattern": "(?i)sources?\\s*:",
+        "appliesWhenExpectedField": "requiresCitation"
+      },
+      "weight": 1
+    },
+    {
+      "name": "response-latency",
+      "type": "latency",
+      "arguments": {
+        "maximumMs": 20000
+      },
+      "weight": 0
+    }
+  ],
+  "thresholds": {
+    "minimumPassRate": 0.9,
+    "maximumP95LatencyMs": 20000,
+    "maximumFailures": 1
+  },
+  "execution": {
+    "mode": "live",
+    "maxParallel": 2,
+    "timeoutSeconds": 120
+  }
+}

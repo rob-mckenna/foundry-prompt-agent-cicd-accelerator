@@ -1,0 +1,79 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/foundry-prompt-agent-cicd-accelerator/schemas/release-record.schema.json",
+  "title": "Release Record",
+  "description": "Deployment record written after every successful environment deployment. Stored outside the package so that the package stays immutable. Rollback reads the previous record to find the package to redeploy.",
+  "type": "object",
+  "required": ["schemaVersion", "releaseId", "environment", "packageId", "agent", "deployment"],
+  "additionalProperties": false,
+  "properties": {
+    "$schema": { "type": "string" },
+    "schemaVersion": { "const": "1.0.0" },
+    "releaseId": { "type": "string", "minLength": 1, "description": "Unique id: <agent>-<environment>-<utc timestamp>-<short package hash>." },
+    "environment": { "enum": ["dev", "test", "uat", "prod"] },
+    "packageId": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" },
+    "packageUri": { "type": "string", "description": "Location the immutable package was retrieved from (artifact feed, blob or release asset)." },
+    "agent": {
+      "type": "object",
+      "required": ["name", "version"],
+      "additionalProperties": false,
+      "properties": {
+        "name": { "type": "string" },
+        "version": { "type": "string" },
+        "remoteAgentId": { "type": "string", "description": "Agent Service assistant id in the target project." }
+      }
+    },
+    "deployment": {
+      "type": "object",
+      "required": ["deployedAtUtc", "deployedBy", "outcome"],
+      "additionalProperties": false,
+      "properties": {
+        "deployedAtUtc": { "type": "string", "format": "date-time" },
+        "deployedBy": { "type": "string", "description": "Pipeline identity name. Never a credential." },
+        "outcome": {
+          "enum": ["pending-verification", "succeeded", "failed", "rolled-back", "simulated"],
+          "description": "A deployment is written as pending-verification and only becomes succeeded once Complete-Release.ps1 has validated the required post-deployment gates."
+        },
+        "operation": { "enum": ["deploy", "promote", "rollback"] },
+        "sourceEnvironment": { "enum": ["dev", "test", "uat", "prod"] },
+        "pipelineRunUrl": { "type": "string" },
+        "approvals": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["gate"],
+            "additionalProperties": false,
+            "properties": {
+              "gate": { "type": "string" },
+              "approvedBy": { "type": "string" },
+              "approvedAtUtc": { "type": "string", "format": "date-time" },
+              "reference": { "type": "string", "description": "Change record or work item id." }
+            }
+          }
+        },
+        "gateResults": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "validation": { "enum": ["passed", "failed", "skipped"] },
+            "evaluation": { "enum": ["passed", "failed", "skipped"] },
+            "regression": { "enum": ["passed", "failed", "skipped"] },
+            "smoke": { "enum": ["passed", "failed", "skipped"] }
+          }
+        }
+      }
+    },
+    "previous": {
+      "type": "object",
+      "description": "State replaced by this deployment. Used by scripts/Invoke-Rollback.ps1.",
+      "additionalProperties": false,
+      "properties": {
+        "packageId": { "type": "string" },
+        "packageUri": { "type": "string" },
+        "agentVersion": { "type": "string" },
+        "remoteAgentId": { "type": "string" },
+        "releaseId": { "type": "string" }
+      }
+    }
+  }
+}

@@ -1,0 +1,126 @@
+name: deploy-test
+
+# Promotes an existing DEV package to TEST, and optionally on to UAT in the same run.
+# The package is never rebuilt: the workflow downloads the artifact produced by the DEV run identified by
+# `sourceRunId` and redeploys those exact bytes with the TEST (then UAT) overlay applied.
+#
+# Set up in GitHub before first use:
+#   1. Environment 'test' with required reviewers and a deployment branch policy limited to main.
+#   2. Environment 'uat' with required reviewers that include the business owners.
+#   3. Environment variables AZURE_CLIENT_ID, AZURE_TENANT_ID, AZURE_SUBSCRIPTION_ID on each environment,
+#      pointing at that environment's app registration and subscription.
+#   4. Federated credentials for repo:<owner>/<repo>:environment:test and :environment:uat.
+#
+# Approvals are enforced by the GitHub Environment, not by this file.
+
+on:
+  workflow_dispatch:
+    inputs:
+      sourceRunId:
+        description: Run id of the deploy-dev workflow whose package should be promoted.
+        type: string
+        required: true
+      agentName:
+        description: Logical agent name (must match agent.manifest.json name).
+        type: string
+        required: true
+        default: simple-support-agent
+      evaluationSuitePath:
+        description: Evaluation suite to run after deployment. Leave empty to skip.
+        type: string
+        required: false
+        default: ''
+      promoteToUat:
+        description: Continue to UAT after TEST succeeds. UAT has its own approval gate.
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: deploy-test-${{ inputs.agentName }}
+  cancel-in-progress: false
+
+jobs:
+  resolve-package:
+    name: Resolve promoted package
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      packageFile: ${{ steps.inspect.outputs.packageFile }}
+      packageId: ${{ steps.inspect.outputs.packageId }}
+      agentVersion: ${{ steps.inspect.outputs.agentVersion }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Download the DEV package artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: agent-package
+          path: artifacts
+          run-id: ${{ inputs.sourceRunId }}
+          github-token: ${{ github.token }}
+
+      - name: Verify and identify the package
+        id: inspect
+        shell: pwsh
+        run: |
+          Set-StrictMode -Version 3.0
+          $ErrorActionPreference = 'Stop'
+          $package = Get-ChildItem ./artifacts -Filter '*.zip' -Recurse | Select-Object -First 1
+          if (-not $package) { throw "Run ${{ inputs.sourceRunId }} produced no package artifact." }
+          $result = ./scripts/Test-AgentPackage.ps1 -PackagePath $package.FullName
+          if ($result.AgentName -ne '${{ inputs.agentName }}') {
+            throw "Artifact holds agent '$($result.AgentName)' but '${{ inputs.agentName }}' was requested."
+          }
+          "packageFile=$($package.Name)"      | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "packageId=$($result.PackageId)"    | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "agentVersion=$($result.Version)"   | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Re-upload for downstream jobs
+        uses: actions/upload-artifact@v4
+        with:
+          name: promoted-package
+          path: artifacts/*.zip
+          if-no-files-found: error
+          retention-days: 365
+
+  deploy-test:
+    name: Promote to TEST
+    needs: resolve-package
+    uses: ./.github/workflows/_reusable-deploy.yml
+    with:
+      environment: test
+      targetEnvironment: test
+      agentName: ${{ inputs.agentName }}
+      agentVersion: ${{ needs.resolve-package.outputs.agentVersion }}
+      artifactName: promoted-package
+      packageFile: ${{ needs.resolve-package.outputs.packageFile }}
+      operation: promote
+      sourceEnvironment: dev
+      runEvaluations: ${{ inputs.evaluationSuitePath != '' }}
+      evaluationSuitePath: ${{ inputs.evaluationSuitePath }}
+      runRegression: true
+      validateSecretReferences: false
+
+  deploy-uat:
+    name: Promote to UAT
+    needs: [resolve-package, deploy-test]
+    if: inputs.promoteToUat
+    uses: ./.github/workflows/_reusable-deploy.yml
+    with:
+      environment: uat
+      targetEnvironment: uat
+      agentName: ${{ inputs.agentName }}
+      agentVersion: ${{ needs.resolve-package.outputs.agentVersion }}
+      artifactName: promoted-package
+      packageFile: ${{ needs.resolve-package.outputs.packageFile }}
+      operation: promote
+      sourceEnvironment: test
+      runEvaluations: ${{ inputs.evaluationSuitePath != '' }}
+      evaluationSuitePath: ${{ inputs.evaluationSuitePath }}
+      runRegression: true
+      validateSecretReferences: true

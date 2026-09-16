@@ -1,0 +1,28 @@
+{
+  "$schema": "../../schemas/tool-definition.schema.json",
+  "schemaVersion": "1.0.0",
+  "id": "client-function",
+  "type": "function",
+  "displayName": "Client-side function",
+  "description": "Declares a function the calling application executes and returns a result for.",
+  "config": {
+    "name": "get_user_context",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "userId": {
+          "type": "string",
+          "description": "Signed-in user object id."
+        }
+      },
+      "required": [
+        "userId"
+      ],
+      "additionalProperties": false
+    }
+  },
+  "governance": {
+    "dataEgress": "none",
+    "requiresSecurityReview": false
+  }
+}

@@ -1,0 +1,19 @@
+{
+  "$schema": "../../schemas/tool-definition.schema.json",
+  "schemaVersion": "1.0.0",
+  "id": "knowledge-search",
+  "type": "azure_ai_search",
+  "displayName": "Azure AI Search knowledge",
+  "description": "Retrieves grounding passages from the enterprise knowledge index.",
+  "config": {
+    "connectionId": "${env:SEARCH_CONNECTION_ID}",
+    "indexName": "${env:SEARCH_INDEX_NAME}",
+    "queryType": "vector_semantic_hybrid",
+    "topK": 5
+  },
+  "governance": {
+    "dataEgress": "internal",
+    "requiresSecurityReview": false,
+    "networkIsolationRequired": true
+  }
+}

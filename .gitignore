@@ -1,0 +1,65 @@
+# Build output and extracted packages
+out/
+artifacts/
+*.package/
+*.zip
+
+# Local release records. The durable copy lives in the release store or in pipeline artifacts.
+releases/
+!schemas/release-record.schema.json
+
+# Terraform
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+*.tfplan
+crash.log
+crash.*.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+.terraformrc
+terraform.rc
+# Never commit variable files that may hold real values; commit environments/*.tfvars instead.
+*.auto.tfvars
+terraform.tfvars
+
+# Bicep compiler output
+*.json.bicep
+main.json
+
+# Credentials and identity material. None of these belong in this repository.
+*.pfx
+*.p12
+*.pem
+*.key
+*.publishsettings
+.azure/
+azureauth.json
+local.settings.json
+.env
+.env.*
+!.env.example
+
+# PowerShell
+*.psproj.user
+PesterTestResults.xml
+coverage.xml
+
+# Editors and operating systems
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.recommended.json
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Node and Python tooling that may be used locally for linting
+node_modules/
+__pycache__/
+*.pyc
+.venv/

@@ -1,0 +1,107 @@
+# Manual rollback of one environment to the previously promoted package.
+#
+# Rollback redeploys known-good bytes from a retained artifact. It never rebuilds from older source.
+# The target environment keeps its approval check: a rollback is still a change.
+
+name: rollback-$(Date:yyyyMMdd)$(Rev:.r)
+
+trigger: none
+pr: none
+
+resources:
+  pipelines:
+    - pipeline: sourcePipeline
+      source: foundry-agents-deploy-test
+      trigger: none
+
+pool:
+  vmImage: ubuntu-latest
+
+parameters:
+  - name: environmentName
+    displayName: Environment to roll back
+    type: string
+    values: [dev, test, uat, prod]
+  - name: agentName
+    displayName: Logical agent name
+    type: string
+  - name: toPackageId
+    displayName: Package id to roll back to (empty uses previous.packageId from the release record)
+    type: string
+    default: ''
+  - name: reason
+    displayName: Reason for the rollback
+    type: string
+
+variables:
+  - template: templates/variables/common.yml
+  - name: serviceConnectionName
+    value: foundry-agents-${{ parameters.environmentName }}
+  - name: variableGroupName
+    value: foundry-agents-${{ parameters.environmentName }}
+
+stages:
+  - stage: rollback
+    displayName: Roll back ${{ parameters.environmentName }}
+    variables:
+      - group: foundry-agents-${{ parameters.environmentName }}
+    jobs:
+      - deployment: rollbackAgent
+        displayName: Roll back ${{ parameters.agentName }}
+        environment: foundry-agents-${{ parameters.environmentName }}
+        timeoutInMinutes: 45
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+
+                - download: sourcePipeline
+                  artifact: agentPackage
+                  displayName: Download retained packages
+
+                - task: AzureCLI@2
+                  displayName: Roll back
+                  inputs:
+                    azureSubscription: foundry-agents-${{ parameters.environmentName }}
+                    scriptType: pscore
+                    scriptLocation: inlineScript
+                    workingDirectory: $(Build.SourcesDirectory)
+                    inlineScript: |
+                      Set-StrictMode -Version 3.0
+                      $ErrorActionPreference = 'Stop'
+                      $env:AZURE_SUBSCRIPTION_ID = '$(azureSubscriptionId)'
+                      $env:AZURE_TENANT_ID = '$(azureTenantId)'
+
+                      $parameters = @{
+                        AgentName         = '${{ parameters.agentName }}'
+                        Environment       = '${{ parameters.environmentName }}'
+                        ArtifactDirectory = '$(Pipeline.Workspace)'
+                        ReleaseDirectory  = '$(Build.ArtifactStagingDirectory)/releases'
+                        Reason            = '${{ parameters.reason }}'
+                        Confirm           = $false
+                      }
+                      if ('${{ parameters.toPackageId }}' -ne '') { $parameters['ToPackageId'] = '${{ parameters.toPackageId }}' }
+                      ./scripts/Invoke-Rollback.ps1 @parameters
+
+                - task: AzureCLI@2
+                  displayName: Smoke test the rolled-back agent
+                  inputs:
+                    azureSubscription: foundry-agents-${{ parameters.environmentName }}
+                    scriptType: pscore
+                    scriptLocation: inlineScript
+                    workingDirectory: $(Build.SourcesDirectory)
+                    inlineScript: |
+                      Set-StrictMode -Version 3.0
+                      $ErrorActionPreference = 'Stop'
+                      $env:AZURE_SUBSCRIPTION_ID = '$(azureSubscriptionId)'
+                      $env:AZURE_TENANT_ID = '$(azureTenantId)'
+                      ./tests/smoke/Invoke-SmokeTest.ps1 `
+                        -Environment '${{ parameters.environmentName }}' `
+                        -AgentName '${{ parameters.agentName }}' `
+                        -ResultPath '$(Build.ArtifactStagingDirectory)/releases/smoke-rollback.json'
+
+                - publish: $(Build.ArtifactStagingDirectory)/releases
+                  artifact: rollbackRecords-${{ parameters.environmentName }}-$(Build.BuildId)
+                  displayName: Publish rollback record
+                  condition: always()

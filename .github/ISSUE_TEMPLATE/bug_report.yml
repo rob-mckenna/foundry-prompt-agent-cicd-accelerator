@@ -1,0 +1,61 @@
+name: Bug report
+description: Something in the accelerator does not work as documented
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not include tokens, connection strings, real endpoints, subscription ids or customer data.
+        Redact them before submitting.
+
+  - type: input
+    id: command
+    attributes:
+      label: Command or workflow
+      description: The exact command or the workflow and job that failed.
+      placeholder: ./scripts/import-agent.ps1 -PackagePath ./out/my-agent-1.0.0+abc1234.zip -Environment test
+    validations:
+      required: true
+
+  - type: textarea
+    id: error
+    attributes:
+      label: Full error output
+      description: Paste the complete message, redacted.
+      render: text
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+    validations:
+      required: true
+
+  - type: input
+    id: powershell
+    attributes:
+      label: PowerShell version
+      description: Output of $PSVersionTable.PSVersion
+    validations:
+      required: true
+
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Where it ran
+      options:
+        - Local Windows
+        - Local Linux or macOS
+        - GitHub Actions
+        - Azure DevOps
+    validations:
+      required: true
+
+  - type: textarea
+    id: validation
+    attributes:
+      label: Output of ./scripts/Invoke-Validation.ps1
+      description: Helps rule out a configuration problem.
+      render: text

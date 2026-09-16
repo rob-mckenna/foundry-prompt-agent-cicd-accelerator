@@ -1,0 +1,17 @@
+{
+  "$schema": "../../../schemas/tool-definition.schema.json",
+  "schemaVersion": "1.0.0",
+  "id": "uploaded-documents",
+  "type": "file_search",
+  "displayName": "Uploaded documents",
+  "description": "Searches documents uploaded to the project vector store for this agent.",
+  "config": {
+    "vectorStoreIds": [
+      "${env:VECTOR_STORE_ID}"
+    ]
+  },
+  "governance": {
+    "dataEgress": "none",
+    "requiresSecurityReview": false
+  }
+}

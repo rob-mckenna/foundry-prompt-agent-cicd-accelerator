@@ -1,0 +1,40 @@
+name: Feature or pattern request
+description: Suggest a capability, pattern or documentation improvement
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What are you unable to do today, and in what enterprise context?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed approach
+      description: If it involves an Azure interface, link the documentation for it. The accelerator does not invent commands.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Agent definition or schemas
+        - Packaging and promotion
+        - GitHub Actions
+        - Azure DevOps
+        - Infrastructure as code
+        - Testing and evaluation
+        - Governance
+        - Documentation
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives you considered

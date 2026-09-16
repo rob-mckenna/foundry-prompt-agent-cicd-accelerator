@@ -1,0 +1,26 @@
+# Code owners
+#
+# Replace these placeholders with real GitHub teams before enabling branch protection.
+# Combine with a ruleset on main that requires code owner review.
+
+# Default owner for anything not matched below.
+*                               @OWNER/agent-platform-team
+
+# Deployment mechanics. Changes here affect every environment.
+/.github/workflows/             @OWNER/agent-platform-team @OWNER/devops-leads
+/azure-devops/                  @OWNER/agent-platform-team @OWNER/devops-leads
+/scripts/                       @OWNER/agent-platform-team
+
+# Contracts. A schema change can invalidate every packaged agent.
+/schemas/                       @OWNER/agent-platform-team @OWNER/architecture-review
+
+# Governance policy. Changing an allowed tool list or a sensitivity ceiling is a control change.
+/config/environments/           @OWNER/agent-platform-team @OWNER/security-review
+/config/environments/prod.json  @OWNER/agent-platform-team @OWNER/security-review @OWNER/service-owners
+/docs/governance.md             @OWNER/agent-platform-team @OWNER/security-review
+
+# Infrastructure.
+/infra/                         @OWNER/agent-platform-team @OWNER/cloud-platform
+
+# Security policy.
+/SECURITY.md                    @OWNER/security-review

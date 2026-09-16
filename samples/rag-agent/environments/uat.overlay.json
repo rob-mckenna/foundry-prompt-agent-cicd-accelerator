@@ -1,0 +1,33 @@
+{
+  "$schema": "../../../schemas/environment-overlay.schema.json",
+  "schemaVersion": "1.0.0",
+  "environment": "uat",
+  "model": {
+    "deploymentName": "gpt-4o",
+    "parameters": {
+      "temperature": 0.2
+    }
+  },
+  "toolOverrides": {
+    "knowledge-search": {
+      "config": {
+        "indexName": "kb-uat-v1",
+        "topK": 5
+      }
+    }
+  },
+  "variables": {
+    "SEARCH_CONNECTION_ID": "/subscriptions/${env:AZURE_SUBSCRIPTION_ID}/resourceGroups/rg-foundry-agents-uat/providers/Microsoft.CognitiveServices/accounts/aifagentsuat/projects/proj-agents-uat/connections/kb-search",
+    "SEARCH_INDEX_NAME": "kb-uat-v1",
+    "VECTOR_STORE_ID": "${env:VECTOR_STORE_ID}"
+  },
+  "metadata": {
+    "environment": "uat"
+  },
+  "deploymentGates": {
+    "requireEvaluationPass": true,
+    "requireSmokeTestPass": true,
+    "requireRegressionPass": true,
+    "minimumEvaluationScore": 0.9
+  }
+}

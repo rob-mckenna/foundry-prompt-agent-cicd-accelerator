@@ -1,0 +1,42 @@
+{
+  "$schema": "../../schemas/tool-definition.schema.json",
+  "schemaVersion": "1.0.0",
+  "id": "entitlement-check",
+  "type": "azure_function",
+  "displayName": "Entitlement check",
+  "description": "Asynchronously verifies caller entitlement through an Azure Function over storage queues.",
+  "config": {
+    "name": "check_entitlement",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "customerId": {
+          "type": "string",
+          "description": "Customer identifier supplied by the caller."
+        },
+        "productCode": {
+          "type": "string",
+          "description": "Product code to check."
+        }
+      },
+      "required": [
+        "customerId",
+        "productCode"
+      ],
+      "additionalProperties": false
+    },
+    "inputQueue": {
+      "storageServiceEndpoint": "${env:FUNCTION_QUEUE_ENDPOINT}",
+      "queueName": "entitlement-input"
+    },
+    "outputQueue": {
+      "storageServiceEndpoint": "${env:FUNCTION_QUEUE_ENDPOINT}",
+      "queueName": "entitlement-output"
+    }
+  },
+  "governance": {
+    "dataEgress": "internal",
+    "requiresSecurityReview": true,
+    "networkIsolationRequired": true
+  }
+}

@@ -1,0 +1,92 @@
+# DEV deployment. The only environment that deploys automatically.
+#
+# Set up in Azure DevOps before first use:
+#   1. Service connection 'foundry-agents-dev' using workload identity federation. No secret is stored.
+#   2. Variable group 'foundry-agents-dev' containing the non-secret values azureSubscriptionId and
+#      azureTenantId. Secret values belong in Key Vault and are referenced from the agent overlay.
+#   3. Environment 'foundry-agents-dev' with no approvals. DEV is intentionally unattended.
+#   4. Branch policy on main requiring the validate pipeline.
+
+name: deploy-dev-$(Date:yyyyMMdd)$(Rev:.r)
+
+trigger:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - samples/**
+      - agents/**
+      - config/environments/dev.json
+      - schemas/**
+      - scripts/**
+      - tests/**
+      - azure-devops/pipelines/**
+
+pr: none
+
+pool:
+  vmImage: ubuntu-latest
+
+parameters:
+  - name: agentPath
+    displayName: Agent source folder
+    type: string
+    default: samples/simple-agent
+  - name: agentName
+    displayName: Logical agent name
+    type: string
+    default: simple-support-agent
+  - name: agentVersion
+    displayName: Agent version (must match the manifest)
+    type: string
+    default: 1.0.0
+
+variables:
+  - template: templates/variables/common.yml
+
+stages:
+  - stage: validate
+    displayName: Offline validation
+    jobs:
+      - job: validation
+        displayName: Validate repository
+        timeoutInMinutes: 25
+        steps:
+          - checkout: self
+          - template: templates/steps/validate.yml
+            parameters:
+              runTerraformValidate: false
+              installPester: true
+
+  - stage: build
+    displayName: Build immutable package
+    dependsOn: validate
+    jobs:
+      - job: package
+        displayName: Package agent
+        timeoutInMinutes: 15
+        steps:
+          - checkout: self
+          - template: templates/steps/package.yml
+            parameters:
+              agentPath: ${{ parameters.agentPath }}
+              artifactName: $(packageArtifactName)
+
+  - template: templates/stages/deploy-stage.yml
+    parameters:
+      stageName: deployDev
+      displayName: Deploy to DEV
+      dependsOn: [build]
+      environmentName: dev
+      azureDevOpsEnvironment: foundry-agents-dev
+      serviceConnection: foundry-agents-dev
+      variableGroup: foundry-agents-dev
+      agentName: ${{ parameters.agentName }}
+      agentVersion: ${{ parameters.agentVersion }}
+      operation: deploy
+      packageArtifactName: agentPackage
+      runEvaluations: false
+      runRegression: false
+      validateSecretReferences: false
+      rollbackOnFailure: false

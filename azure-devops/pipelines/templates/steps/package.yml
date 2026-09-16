@@ -1,0 +1,46 @@
+# Builds the immutable agent package and publishes it as a pipeline artifact.
+# Packaging is a pure local transformation, so no Azure credentials are used.
+
+parameters:
+  - name: agentPath
+    type: string
+  - name: artifactName
+    type: string
+    default: agentPackage
+
+steps:
+  - task: PowerShell@2
+    name: buildPackage
+    displayName: Build immutable package
+    inputs:
+      pwsh: true
+      targetType: inline
+      workingDirectory: $(Build.SourcesDirectory)
+      script: |
+        Set-StrictMode -Version 3.0
+        $ErrorActionPreference = 'Stop'
+        $result = ./scripts/New-AgentPackage.ps1 `
+          -AgentPath '${{ parameters.agentPath }}' `
+          -OutputDirectory '$(Build.ArtifactStagingDirectory)/package' `
+          -SourceCommit '$(Build.SourceVersion)'
+
+        Write-Host "##vso[task.setvariable variable=packageId;isOutput=true]$($result.PackageId)"
+        Write-Host "##vso[task.setvariable variable=packageFile;isOutput=true]$(Split-Path -Leaf $result.PackagePath)"
+        Write-Host "##vso[task.setvariable variable=agentName;isOutput=true]$($result.AgentName)"
+        Write-Host "##vso[task.setvariable variable=agentVersion;isOutput=true]$($result.Version)"
+
+  - task: PowerShell@2
+    displayName: Verify package integrity
+    inputs:
+      pwsh: true
+      targetType: inline
+      workingDirectory: $(Build.SourcesDirectory)
+      script: |
+        Set-StrictMode -Version 3.0
+        $ErrorActionPreference = 'Stop'
+        $package = Get-ChildItem '$(Build.ArtifactStagingDirectory)/package' -Filter '*.zip' | Select-Object -First 1
+        ./scripts/Test-AgentPackage.ps1 -PackagePath $package.FullName
+
+  - publish: $(Build.ArtifactStagingDirectory)/package
+    artifact: ${{ parameters.artifactName }}
+    displayName: Publish immutable package

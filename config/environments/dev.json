@@ -1,0 +1,64 @@
+{
+  "$schema": "../../schemas/environment-config.schema.json",
+  "schemaVersion": "1.0.0",
+  "environment": "dev",
+  "displayName": "Development",
+  "azure": {
+    "tenantId": "${env:AZURE_TENANT_ID}",
+    "subscriptionId": "${env:AZURE_SUBSCRIPTION_ID}",
+    "resourceGroup": "rg-foundry-agents-dev",
+    "location": "eastus2"
+  },
+  "foundry": {
+    "accountName": "aifagentsdev",
+    "projectName": "proj-agents-dev",
+    "projectEndpoint": "https://aifagentsdev.services.ai.azure.com/api/projects/proj-agents-dev",
+    "apiVersion": "v1",
+    "tokenScope": "https://ai.azure.com/.default",
+    "defaultModelDeployment": "gpt-4o-mini"
+  },
+  "keyVault": {
+    "name": "kv-fnd-agents-dev",
+    "uri": "https://kv-fnd-agents-dev.vault.azure.net/"
+  },
+  "runtime": {
+    "allowedVariables": [
+      "AZURE_SUBSCRIPTION_ID",
+      "AZURE_TENANT_ID",
+      "SEARCH_INDEX_NAME",
+      "VECTOR_STORE_ID"
+    ]
+  },
+  "packageStore": {
+    "type": "azureBlob",
+    "accountName": "stfndagentsdev",
+    "container": "agent-packages"
+  },
+  "releaseStore": {
+    "type": "azureBlob",
+    "accountName": "stfndagentsdev",
+    "container": "agent-releases"
+  },
+  "deployment": {
+    "autoDeploy": true,
+    "approvalRequired": false,
+    "changeWindow": "Continuous. Every merge to main deploys automatically.",
+    "rollbackMode": "redeploy-previous-package"
+  },
+  "governance": {
+    "allowedToolTypes": [
+      "code_interpreter",
+      "file_search",
+      "azure_ai_search",
+      "openapi",
+      "azure_function",
+      "function",
+      "bing_grounding",
+      "mcp"
+    ],
+    "maxDataSensitivity": "confidential",
+    "requireOwnerMetadata": true,
+    "requireResponsibleAiReview": false,
+    "maxTemperature": 1.5
+  }
+}

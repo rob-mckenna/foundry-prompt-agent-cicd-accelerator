@@ -1,0 +1,22 @@
+{
+  "$schema": "../../../schemas/tool-definition.schema.json",
+  "schemaVersion": "1.0.0",
+  "id": "web-grounding",
+  "type": "bing_grounding",
+  "displayName": "Public web grounding",
+  "description": "Public web lookups for carrier service alerts. Sends query text outside the tenant boundary.",
+  "config": {
+    "connectionId": "${env:BING_CONNECTION_ID}",
+    "count": 5,
+    "market": "en-US",
+    "setLang": "en"
+  },
+  "governance": {
+    "dataEgress": "external",
+    "requiresSecurityReview": true,
+    "allowedEnvironments": [
+      "dev",
+      "test"
+    ]
+  }
+}

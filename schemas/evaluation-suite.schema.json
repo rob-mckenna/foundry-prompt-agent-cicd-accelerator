@@ -1,0 +1,73 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/foundry-prompt-agent-cicd-accelerator/schemas/evaluation-suite.schema.json",
+  "title": "Evaluation Suite",
+  "description": "Declarative evaluation and regression definition executed by tests/evaluations/Invoke-EvaluationSuite.ps1. Datasets are JSONL files packaged with the agent.",
+  "type": "object",
+  "required": ["schemaVersion", "id", "dataset", "evaluators", "thresholds"],
+  "additionalProperties": false,
+  "properties": {
+    "$schema": { "type": "string" },
+    "schemaVersion": { "const": "1.0.0" },
+    "id": { "type": "string", "pattern": "^[a-z][a-z0-9-]{2,62}$" },
+    "displayName": { "type": "string" },
+    "description": { "type": "string" },
+    "appliesTo": {
+      "type": "array",
+      "items": { "enum": ["dev", "test", "uat", "prod"] },
+      "description": "Environments where this suite is executed. PROD suites should be read-only and low volume."
+    },
+    "dataset": {
+      "type": "object",
+      "required": ["file", "format"],
+      "additionalProperties": false,
+      "properties": {
+        "file": { "type": "string", "description": "Path, relative to the suite file, of the dataset." },
+        "format": { "const": "jsonl" },
+        "inputField": { "type": "string", "default": "query" },
+        "expectedField": { "type": "string", "default": "expected" },
+        "contextField": { "type": "string", "default": "context" },
+        "maxRecords": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "evaluators": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["name", "type"],
+        "additionalProperties": false,
+        "properties": {
+          "name": { "type": "string", "pattern": "^[a-z][a-z0-9_-]{1,62}$" },
+          "type": {
+            "enum": ["exact-match", "contains-all", "regex-match", "json-schema", "not-contains", "latency", "ai-quality"],
+            "description": "Deterministic evaluators run offline. ai-quality delegates to an Azure AI evaluation runner configured through evaluationRunner in the environment config."
+          },
+          "field": { "type": "string", "default": "output" },
+          "arguments": { "type": "object", "additionalProperties": true },
+          "weight": { "type": "number", "minimum": 0, "maximum": 1, "default": 1 }
+        }
+      }
+    },
+    "thresholds": {
+      "type": "object",
+      "required": ["minimumPassRate"],
+      "additionalProperties": false,
+      "properties": {
+        "minimumPassRate": { "type": "number", "minimum": 0, "maximum": 1 },
+        "maximumP95LatencyMs": { "type": "integer", "minimum": 1 },
+        "maximumFailures": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "execution": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "mode": { "enum": ["live", "offline-fixture"], "default": "live" },
+        "fixtureFile": { "type": "string", "description": "Recorded responses used when mode is offline-fixture so that the suite can run without Azure access." },
+        "maxParallel": { "type": "integer", "minimum": 1, "maximum": 8, "default": 1 },
+        "timeoutSeconds": { "type": "integer", "minimum": 5, "maximum": 600, "default": 120 }
+      }
+    }
+  }
+}

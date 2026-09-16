@@ -1,0 +1,114 @@
+name: rollback
+
+# Manual rollback of one environment to the previously promoted package.
+# Automatic rollback also runs inside _reusable-deploy.yml when post-deployment testing fails; this workflow
+# exists for the case where a problem is discovered later, after the deployment run has finished.
+#
+# Rollback redeploys known-good bytes. It never rebuilds from older source, so the rolled-back state is
+# byte-for-byte what was previously verified in that environment.
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Environment to roll back.
+        type: choice
+        options: [dev, test, uat, prod]
+        required: true
+      agentName:
+        description: Logical agent name.
+        type: string
+        required: true
+      packageRunId:
+        description: Run id of the workflow whose artifact holds the package to roll back to.
+        type: string
+        required: true
+      packageArtifactName:
+        description: Artifact name inside that run.
+        type: string
+        required: true
+        default: promoted-package
+      toPackageId:
+        description: Explicit sha256:... package id. Leave empty to use previous.packageId from the current release record.
+        type: string
+        required: false
+        default: ''
+      reason:
+        description: Why this rollback is happening. Recorded in the release record.
+        type: string
+        required: true
+
+permissions:
+  contents: read
+  actions: read
+  id-token: write
+
+concurrency:
+  group: rollback-${{ inputs.environment }}-${{ inputs.agentName }}
+  cancel-in-progress: false
+
+jobs:
+  rollback:
+    name: Roll back ${{ inputs.environment }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment:
+      # The same approval gate as a forward deployment. A rollback is still a production change.
+      name: ${{ inputs.environment }}
+    env:
+      AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+      AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+      AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Download candidate packages
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.packageArtifactName }}
+          path: artifacts
+          run-id: ${{ inputs.packageRunId }}
+          github-token: ${{ github.token }}
+
+      - name: Sign in to Azure with workload identity federation
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Roll back
+        shell: pwsh
+        run: |
+          Set-StrictMode -Version 3.0
+          $ErrorActionPreference = 'Stop'
+          $parameters = @{
+            AgentName         = '${{ inputs.agentName }}'
+            Environment       = '${{ inputs.environment }}'
+            ArtifactDirectory = './artifacts'
+            ReleaseDirectory  = './out/releases'
+            Reason            = '${{ inputs.reason }}'
+            Confirm           = $false
+          }
+          if ('${{ inputs.toPackageId }}' -ne '') { $parameters['ToPackageId'] = '${{ inputs.toPackageId }}' }
+          ./scripts/Invoke-Rollback.ps1 @parameters
+
+      - name: Smoke test the rolled-back agent
+        shell: pwsh
+        run: |
+          Set-StrictMode -Version 3.0
+          $ErrorActionPreference = 'Stop'
+          ./tests/smoke/Invoke-SmokeTest.ps1 `
+            -Environment '${{ inputs.environment }}' `
+            -AgentName '${{ inputs.agentName }}' `
+            -ResultPath './out/smoke-rollback.json'
+
+      - name: Upload rollback record
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rollback-${{ inputs.environment }}-${{ github.run_id }}
+          path: out/
+          if-no-files-found: ignore
+          retention-days: 365

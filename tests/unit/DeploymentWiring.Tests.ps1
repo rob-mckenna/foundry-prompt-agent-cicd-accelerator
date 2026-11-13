@@ -1010,11 +1010,13 @@ Describe 'Hosted offline validation contract' -Tag 'HostedOffline' {
         $installStep = [regex]::Match($workflow, '(?s)- name: Install Foundry SDK dependencies.*?(?=\n      - name:)').Value
         $installStep | Should -Match 'shell: bash'
         $installStep | Should -Match 'python -m pip install --disable-pip-version-check -r scripts/python/requirements\.txt'
+        $installStep | Should -Match '(?m)^\s+run:\s+python -m pip install[^\r\n]*\bPyYAML==\d+\.\d+\.\d+(?:\s|$)'
         $testStep = [regex]::Match($workflow, '(?s)- name: Run Python unit tests.*?(?=\n      - name:)').Value
         $testStep | Should -Match 'shell: bash'
         $testStep | Should -Match "python -m unittest discover -s tests/unit/python -p 'test_\*\.py' -v"
         $workflow.IndexOf('uses: actions/setup-python@v5') | Should -BeLessThan $workflow.IndexOf('name: Install Foundry SDK dependencies')
         $workflow.IndexOf('name: Install Foundry SDK dependencies') | Should -BeLessThan $workflow.IndexOf('name: Run Python unit tests')
+        $workflow.IndexOf('name: Install Foundry SDK dependencies') | Should -BeLessThan $workflow.IndexOf('name: Run offline validation suite')
         $testStep | Should -Not -Match 'continue-on-error|if:'
     }
 }

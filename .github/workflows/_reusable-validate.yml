@@ -38,7 +38,8 @@ jobs:
 
       - name: Install Foundry SDK dependencies
         shell: bash
-        run: python -m pip install --disable-pip-version-check -r scripts/python/requirements.txt
+        # Test-YamlFile invokes this Python; install its pinned parser in the same environment.
+        run: python -m pip install --disable-pip-version-check -r scripts/python/requirements.txt PyYAML==6.0.3
 
       - name: Run Python unit tests
         shell: bash

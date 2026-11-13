@@ -2242,6 +2242,7 @@ function Get-FoundryAccessToken {
         federation service connection (Azure DevOps). No secret is accepted or emitted by this function; the
         token is returned as a SecureString and is never written to the console.
     #>
+    [System.Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingConvertToSecureStringWithPlainText', '', Justification = 'Converts the runtime Azure CLI access-token response to the existing SecureString return contract; no source-embedded credential.')]
     [CmdletBinding()]
     [OutputType([securestring])]
     param(
@@ -2513,6 +2514,7 @@ function Resolve-SecretReference {
         Uses the signed-in workload identity. The value is returned as a SecureString and must never be
         converted to plain text for logging, pipeline variables or command line arguments.
     #>
+    [System.Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingConvertToSecureStringWithPlainText', '', Justification = 'Converts a runtime Azure CLI Key Vault lookup result to the existing SecureString return contract; source contains only the validated reference.')]
     [CmdletBinding()]
     [OutputType([securestring])]
     param([Parameter(Mandatory)][string]$Reference)

@@ -40,14 +40,14 @@ flowchart TB
         W3["Authenticated az session in the task"]
     end
     D4 --> W1 --> W2 --> W3
-    W3 --> DEP1["Verify package<br/>Resolve overlay<br/>Governance gate<br/>Preflight<br/>POST /assistants"]
+    W3 --> DEP1["Verify descriptor-bound package<br/>resolve overlay + governance + preflight<br/>stage prior package + attested JSON<br/>persist started BEFORE create + verify pin"]
     DEP1 --> FDEV["Foundry DEV project"]
-    DEP1 --> SM1["Smoke test"]
-    SM1 --> R1["Release record artifact"]
+    DEP1 --> SM1["Release-bound live gates<br/>SDK Conversations/Responses<br/>Complete-Release attestation"]
+    SM1 --> R1["Attested release record artifact<br/>transported with the package"]
 
     D3 --> TESTP["deploy-test.yml (manual)<br/>resources.pipelines: devPipeline"]
     subgraph PROMO["Promotion, no rebuild"]
-        T1["download: devPipeline<br/>artifact agentPackage"]
+        T1["download: devPipeline<br/>package + attested DEV release"]
         T2["Test-AgentPackage.ps1<br/>content address must match"]
         T3["Environment foundry-agents-test<br/>approval check"]
         T4["promote-agent.ps1 with the TEST overlay"]
@@ -61,22 +61,41 @@ flowchart TB
         P1["Stage preflight:<br/>typed confirmation, change record format,<br/>artifact verification"]
         P2["Environment foundry-agents-prod<br/>approval + business hours + exclusive lock + branch control"]
         P3["Promote identical package"]
-        P4["Smoke + regression"]
+        P4["Required live gates + Complete-Release<br/>exact release/service identity"]
         P5{"Passed?"}
         P6["Release record"]
-        P7["Automatic rollback"]
+        P7["One verified Invoke-Rollback attempt<br/>prior package + attested JSON<br/>new service version + required gates"]
     end
     PRODP --> P1 --> P2 --> P3 --> P4 --> P5
     P5 -->|yes| P6
     P5 -->|no| P7
 ```
 
+The same Python 3.10+ plus `scripts/python/requirements.txt` prerequisite applies to Azure DevOps agents.
+The shipped stage selects Python 3.11, installs those exact pins, and invokes `scripts/Complete-Release.ps1`
+after smoke/regression/evaluation with an always-running condition. Each runner receives the exact returned
+`-ReleaseRecordPath`; evidence binds release/package/project/manifest/service identity and post-activation
+times. Required smoke includes a live canary. Offline, skipped, unbound, failed or missing required evidence
+marks the record failed before the separate staged-artifact rollback handler runs.
+
+That handler and the manual workflow use centralized `Invoke-Rollback.ps1`: exact failed/current context,
+retained prior package and attested release JSON, drift checks, a new service version, required target-overlay
+gates and `Complete-Release`. No pending record counts as recovery, and a recovered forward job still fails.
+First deployment without a known-good prior artifact requires explicit manual recovery and may be exposed
+before gates. Source/SDK validation has not qualified these paths against Azure.
+
+Deploy, test and rollback use the same Environment with `lockBehavior: sequential`. Configure its exclusive-lock
+check externally for every managed environment; YAML alone does not create that check. Concurrent out-of-band
+routing edits are unsupported, and before/after checks cannot prove the absence of transient external edits.
+
 ## Why `resources.pipelines` rather than a repository checkout of the package
 
 Declaring the upstream pipeline as a resource and using `download: devPipeline` binds the promotion to a
 specific completed run. The pipeline still checks out `self`, but only to get the scripts and the environment
 configuration; the agent bytes come from the artifact. `Test-AgentPackage.ps1` then recomputes the content
-address, so a substituted artifact fails before any deployment step.
+descriptor-bound `/2` address (or strict legacy `/1`), so substitution fails before mutation. Reproducible IDs
+do not guarantee byte-identical ZIP builds; promotion carries the original archive unchanged. Target overlays
+and external model/knowledge/connection/secret state can still yield different runtime behaviour.
 
 ## Azure DevOps configuration required
 

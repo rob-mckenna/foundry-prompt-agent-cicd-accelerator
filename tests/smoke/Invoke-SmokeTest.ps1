@@ -11,8 +11,8 @@
       2. Configuration: model deployment name and tool count match the package that was deployed.
       3. Liveness: one canary prompt per check completes and satisfies simple content assertions.
 
-    Layer 3 creates a thread and deletes it afterwards. Use -SkipLiveRun in environments where even a canary
-    conversation is not acceptable.
+    Layer 3 uses agent-bound SDK Responses/Conversations and cleans up the conversation. -SkipLiveRun and
+    standalone results without -ReleaseRecordPath are non-attestable.
 
     A smoke failure in TEST, UAT or PROD should trigger scripts/Invoke-Rollback.ps1.
 
@@ -53,6 +53,8 @@ param(
 
     [string]$ResultPath,
 
+    [string]$ReleaseRecordPath,
+
     [switch]$SkipLiveRun
 )
 
@@ -60,7 +62,7 @@ Set-StrictMode -Version 3.0
 $ErrorActionPreference = 'Stop'
 
 $moduleRoot = Join-Path (Split-Path -Parent (Split-Path -Parent $PSScriptRoot)) 'scripts/modules/FoundryAgentOps/FoundryAgentOps.psd1'
-Import-Module $moduleRoot -Force
+Import-Module $moduleRoot
 
 $repoRoot = Get-RepositoryRoot
 if (-not $ChecksPath) { $ChecksPath = Join-Path $PSScriptRoot 'smoke-checks.json' }
@@ -77,8 +79,13 @@ if (Test-Path -LiteralPath $ChecksPath) {
 
 $results = [System.Collections.Generic.List[pscustomobject]]::new()
 function Add-Check {
-    param([string]$Name, [ValidateSet('passed', 'failed', 'skipped')][string]$Result, [string]$Detail = '')
-    $results.Add([pscustomobject]@{ Name = $Name; Result = $Result; Detail = $Detail })
+    param([string]$Name, [ValidateSet('passed', 'failed', 'skipped')][string]$Result, [string]$Detail = '', $Response)
+    $results.Add([pscustomobject]@{
+        Name = $Name; Result = $Result; Detail = $Detail; Live = ($null -ne $Response)
+        Status = if ($Response) { $Response.Status } else { $null }
+        ResponseId = if ($Response) { $Response.ResponseId } else { $null }
+        ConversationId = if ($Response) { $Response.ConversationId } else { $null }
+    })
     switch ($Result) {
         'passed' { Write-OpsLog -Level Success -Message $Name }
         'failed' { Write-OpsLog -Level Error -Message "$Name :: $Detail" }
@@ -87,15 +94,20 @@ function Add-Check {
 }
 
 $config = Get-EnvironmentConfig -Environment $Environment -ConfigRoot $ConfigRoot
-$tenantId = if ($config['azure'].Contains('tenantId')) { [string]$config['azure']['tenantId'] } else { $null }
-$accessToken = $null
+$startedUtc = [DateTime]::UtcNow.ToString('o')
+$target = $null
 
 try {
-    $accessToken = Get-FoundryAccessToken -Scope $config['foundry']['tokenScope'] -TenantId $tenantId
-
     Write-OpsLog -Level Step -Message "Smoke testing '$AgentName' in '$Environment'"
 
-    $agent = Get-FoundryAgent -EnvironmentConfig $config -LogicalName $AgentName -AccessToken $accessToken
+    if ($ReleaseRecordPath) {
+        $target = Get-FoundryReleaseTarget -ReleaseRecordPath $ReleaseRecordPath -EnvironmentConfig $config
+        if ($target.Record['agent']['name'] -cne $AgentName -or
+            ($ExpectedVersion -and $ExpectedVersion -cne $target.Record['agent']['version'])) { throw 'Smoke target identity mismatch.' }
+        $ExpectedVersion = $target.Record['agent']['version']
+        $agent = $target.Agent
+    }
+    else { $agent = Get-FoundryAgent -EnvironmentConfig $config -LogicalName $AgentName }
     if (-not $agent) {
         Add-Check -Name 'Agent exists' -Result failed -Detail "No agent with metadata logical_name '$AgentName' found in project '$($config['foundry']['projectName'])'."
         throw "Smoke test aborted: the agent was not found."
@@ -155,11 +167,11 @@ try {
         foreach ($check in $checks) {
             $name = "Canary: $($check['id'])"
             $timeout = if ($check.Contains('timeoutSeconds')) { [int]$check['timeoutSeconds'] } else { 90 }
-            $response = Invoke-FoundryAgentRun -EnvironmentConfig $config -AgentId $agent.id -Prompt $check['prompt'] `
-                -AccessToken $accessToken -TimeoutSeconds $timeout
+            $response = Invoke-FoundryAgentRun -EnvironmentConfig $config -LogicalName $AgentName -AgentVersion $agent.activeVersion `
+                -Prompt $check['prompt'] -TimeoutSeconds $timeout
 
             if ($response.Status -ne 'completed') {
-                Add-Check -Name $name -Result failed -Detail "run status '$($response.Status)' $($response.Error)"
+                Add-Check -Name $name -Result failed -Detail "run status '$($response.Status)' $($response.Error)" -Response $response
                 continue
             }
 
@@ -181,17 +193,15 @@ try {
             }
 
             if ($problems.Count -eq 0) {
-                Add-Check -Name $name -Result passed -Detail "$($response.LatencyMs) ms"
+                Add-Check -Name $name -Result passed -Detail "$($response.LatencyMs) ms" -Response $response
             }
             else {
-                Add-Check -Name $name -Result failed -Detail ($problems -join '; ')
+                Add-Check -Name $name -Result failed -Detail ($problems -join '; ') -Response $response
             }
         }
     }
 }
-finally {
-    if ($accessToken) { $accessToken.Dispose() }
-}
+finally {}
 
 $passed = @($results | Where-Object Result -EQ 'passed').Count
 $failed = @($results | Where-Object Result -EQ 'failed').Count
@@ -200,11 +210,19 @@ $skipped = @($results | Where-Object Result -EQ 'skipped').Count
 $summary = [ordered]@{
     agentName   = $AgentName
     environment = $Environment
-    executedUtc = [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')
+    executedUtc = [DateTime]::UtcNow.ToString('o')
     passed      = $passed
     failed      = $failed
     skipped     = $skipped
     checks      = @($results)
+    schemaVersion = '1.1.0'
+    gate = 'smoke'
+    mode = 'unbound'
+    startedUtc = $startedUtc
+    liveExecuted = @($results | Where-Object Live).Count
+}
+if ($target -and -not $SkipLiveRun) {
+    foreach ($key in $target.Identity.Keys) { $summary[$key] = $target.Identity[$key] }
 }
 if ($ResultPath) { Write-JsonFile -InputObject $summary -Path $ResultPath -Depth 8 -Confirm:$false | Out-Null }
 

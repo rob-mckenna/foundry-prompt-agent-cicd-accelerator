@@ -10,7 +10,7 @@ flowchart TB
         B1["New-AgentPackage.ps1"]
         B2["Resolve every environment offline"]
         B3["checksums.sha256 over all files"]
-        B4["packageId = sha256 of the content manifest"]
+        B4["/2 packageId = SHA-256 of format +<br/>canonical stable descriptor + content manifest"]
         B5[("operations-copilot-2.1.0+ab12cd3.zip<br/>packageId sha256:832e1b...")]
         B1 --> B2 --> B3 --> B4 --> B5
     end
@@ -53,17 +53,27 @@ flowchart TB
         P1 --> P2 --> P3 --> P4 --> P5
     end
 
-    P5 --> DONE["Release record:<br/>packageId, agent id, approvals, gate results,<br/>previous package for rollback"]
+    P5 --> DONE["Attested 1.1.0 release record:<br/>packageId + manifest/service identity<br/>release-bound live evidence<br/>prior package + attested JSON"]
 ```
+
+Each deployment writes `pending-verification` first. The environment only becomes promotable after
+`scripts/Complete-Release.ps1` has attached release-bound live evidence and marked the record `succeeded`.
+Runners receive the exact `-ReleaseRecordPath`; package, release, environment, endpoint, manifest semver,
+opaque service version and execution after verified activation must agree. Required smoke needs at least one
+successful live canary; fixtures, baseline updates, unbound, skipped, empty or failed required results cannot pass.
+
+`/2` identity excludes only the specified volatile descriptor provenance; strict descriptor-bound `/1`
+verification remains. Reproducible IDs are not byte-identical ZIP builds. Promotion carries the retained
+original archive without rebuilding, and same-ID/different-byte blob publication fails.
 
 ## What changes between environments and what does not
 
 ```mermaid
 flowchart LR
-    subgraph IMMUTABLE["Identical in every environment"]
-        I1["Instruction text"]
-        I2["Tool definitions"]
-        I3["Evaluation datasets"]
+    subgraph IMMUTABLE["Unchanged archive content, not identical runtime"]
+        I1["Packaged instruction source"]
+        I2["Packaged tool definitions"]
+        I3["Packaged evaluation datasets"]
         I4["Agent logical name and version"]
         I5["packageId"]
     end
@@ -74,7 +84,7 @@ flowchart LR
         V3["Search index name and connection id"]
         V4["Which tools are enabled"]
         V5["Key Vault references"]
-        V6["Metadata such as change_record"]
+        V6["Version metadata such as environment<br/>and governance change_record"]
         V7["Gate thresholds"]
     end
 
@@ -82,8 +92,10 @@ flowchart LR
     VARIABLE --> AGENT
 ```
 
-If a value needs to differ between environments it belongs in the overlay. If it does not, it belongs in the
-manifest. There is no third place, which is what keeps promotion honest.
+Package-owned differences belong in overlays; stable source belongs in the manifest. Resolved instructions
+and tools can differ. External model deployments, knowledge contents, connections, secrets and environment
+configuration are not frozen by the archive, so each environment needs its own live gates. `agent.version`
+is manifest semver; every deployment creates a separate opaque service version and release attempt.
 
 ## Rollback
 
@@ -95,23 +107,36 @@ sequenceDiagram
     participant AS as Agent Service
 
     Note over OPS: Smoke or regression fails in PROD
-    OPS->>REC: Read latest release record for the agent in PROD
-    REC-->>OPS: current packageId, previous.packageId, previous.remoteAgentId
-    OPS->>ART: Find the artifact whose content address equals previous.packageId
-    alt Artifact found
-        ART-->>OPS: Immutable package
-        OPS->>OPS: Verify checksums and content address
-        OPS->>AS: POST /assistants/{id} with the previous definition
-        AS-->>OPS: Updated
-        OPS->>REC: Write a rollback release record
-        Note over OPS: Re-run smoke tests before closing the incident
-    else Artifact missing
+    OPS->>REC: Load exact failed/current release context
+    REC-->>OPS: previous package + release + service identity
+    OPS->>ART: Find prior package AND exact attested release JSON
+    alt Both retained and verified
+        ART-->>OPS: Immutable package + known-good release
+        OPS->>AS: Verify serving version is recorded candidate or prior
+        OPS->>OPS: Verify target-overlay gates/prerequisites
+        OPS->>AS: Create new service version; pin 100% and read back
+        AS-->>OPS: Verified new routing, not recovery yet
+        OPS->>AS: Required live gates via SDK Conversations/Responses
+        OPS->>REC: Complete-Release attests rollback succeeded or failed
+        Note over OPS: Only succeeded is verified recovery.<br/>Original forward job remains failed.
+    else Artifact or known-good record missing
         ART-->>OPS: Not found
         Note over OPS: Rollback fails loudly. It never rebuilds from older source,<br/>because a rebuild is not the artifact that was verified.
     end
 ```
 
-Rollback keeps the target environment's approval gate. A rollback is still a production change.
+Rollback keeps the target environment's approval gate. A rollback is still a production change. In the
+reusable deploy workflows, import stages the exact prior package before mutation and returns its path to the
+single failure handler, along with the prior attested JSON. `latest.json` is only the latest audit attempt,
+not evidence of active or known-good state. `Invoke-Rollback.ps1` centralizes redeployment, required live
+gates and attestation, with no recursive recovery; manual workflows do not duplicate those gates.
+
+Deploy, test and rollback must share an agent/environment lock. Managed live routing is an enabled Responses
+endpoint with one fixed concrete version at 100%, verified before/after invocation, not latest or split traffic.
+Out-of-band concurrent routing edits are unsupported and transient changes may escape observation.
+First creation can affect traffic before explicit pinning/gates; without a known-good prior artifact, failure
+requires explicit manual recovery. Rollback replays package source, not frozen external runtime state.
+Authenticated Azure deployment, inference and recovery remain unqualified by offline validation.
 
 ## Promotion rules enforced in code
 

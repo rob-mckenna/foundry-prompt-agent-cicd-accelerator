@@ -15,9 +15,12 @@
       5. The prior deployed package is resolved and staged so that automatic rollback is actually possible.
          In an environment configured for redeploy-previous-package rollback, an unresolvable prior artifact
          aborts the deployment before anything is mutated.
-      6. A read-only Agent Service preflight confirms endpoint and api-version.
-      7. The agent is created or updated, the package is published to the content-addressed store, and a
-         release record is written with outcome 'pending-verification'.
+      6. A read-only Azure AI Projects SDK preflight confirms endpoint, authentication and SDK availability.
+         The SDK client does not consume the retained REST apiVersion setting.
+      7. The candidate package is published to the target environment's content-addressed store and a prepared
+         release record is made durable.
+      8. Mutation intent is durable before create_version; returned service identity is persisted before
+         activation. Activation completion is recorded only after selector read-back verification.
 
     The record only becomes 'succeeded' when scripts/Complete-Release.ps1 has validated the required
     post-deployment gates against real, non-empty test evidence. Promotion refuses anything else.
@@ -37,8 +40,15 @@
 .PARAMETER ChangeRecordId
     Approved change record id. Required when the environment's governance requires change_record metadata.
 
+.PARAMETER BusinessSignoffId
+    Durable UAT business acceptance reference. PROD requires the format BSO- followed by 4-10 digits.
+
 .PARAMETER RollbackStageDirectory
-    Directory that receives the prior package so a failing gate can roll back. Defaults to ./out/rollback.
+    Directory that receives the prior package and attested release JSON. Defaults to ReleaseDirectory/rollback-staged.
+
+.PARAMETER GateResult
+    Deployment gate outcomes to record in the pending release record. Validation defaults to 'passed' and any
+    supplied keys override that default without discarding it.
 
 .EXAMPLE
     ./scripts/import-agent.ps1 -PackagePath ./out/support-agent-1.2.0+ab12cd3.zip -Environment dev
@@ -66,6 +76,12 @@ param(
 
     [string]$ChangeRecordId,
 
+    [string]$BusinessSignoffId,
+
+    [string]$OriginalChangeRecordId,
+
+    [string]$RollbackReason,
+
     [string]$ConfigRoot,
 
     [string]$ReleaseDirectory,
@@ -74,27 +90,73 @@ param(
 
     [string[]]$PriorArtifactSearchDirectory = @(),
 
-    [string]$PackageUri,
+    [hashtable]$GateResult,
 
     [switch]$ValidateSecretReferences,
 
     [switch]$SkipPreflight,
 
-    [switch]$AllowMissingRollbackArtifact
+    [switch]$AllowMissingRollbackArtifact,
+
+    [string]$DeploymentEvidencePath,
+
+    [string]$RollbackContextPath,
+
+    [string]$RollbackTargetRecordPath,
+
+    [ValidateSet('None', 'AfterPackagePublication', 'AfterActivation')]
+    [string]$TestFailurePoint = 'None'
 )
 
 Set-StrictMode -Version 3.0
 $ErrorActionPreference = 'Stop'
 
-Import-Module (Join-Path $PSScriptRoot 'modules/FoundryAgentOps/FoundryAgentOps.psd1') -Force
+Import-Module (Join-Path $PSScriptRoot 'modules/FoundryAgentOps/FoundryAgentOps.psd1')
 
 $repoRoot = Get-RepositoryRoot
 if (-not $ReleaseDirectory) { $ReleaseDirectory = Join-Path $repoRoot 'out/releases' }
-if (-not $RollbackStageDirectory) { $RollbackStageDirectory = Join-Path $repoRoot 'out/rollback' }
+if (-not $RollbackStageDirectory) { $RollbackStageDirectory = Join-Path $ReleaseDirectory 'rollback-staged' }
+if (-not $DeploymentEvidencePath) { $DeploymentEvidencePath = Join-Path $ReleaseDirectory 'deployment-evidence.json' }
 
-$extractRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("foundry-pkg-" + [Guid]::NewGuid().ToString('n'))
+$extractRoot = Join-Path $repoRoot ("out\platform-work\foundry-pkg-" + [Guid]::NewGuid().ToString('n'))
 $cleanupRequired = $false
-$accessToken = $null
+$descriptor = $null
+$config = $null
+$gates = $null
+$record = $null
+$recordPath = $null
+$packageUri = $null
+$agentName = $null
+$packageId = $null
+$rollbackArtifact = $null
+$mutationStarted = $false
+$mutationCompleted = $false
+$failedReleaseAttempted = $false
+$failedReleaseRecorded = $false
+$failureMessage = $null
+
+function Write-DeploymentEvidence {
+    $evidence = [ordered]@{
+        schemaVersion          = '1.0.0'
+        environment            = $Environment
+        priorArtifactStaged    = [bool]$rollbackArtifact
+        mutationStarted        = $mutationStarted
+        mutationCompleted      = $mutationCompleted
+        failedReleaseAttempted = $failedReleaseAttempted
+        failedReleaseRecorded  = $failedReleaseRecorded
+    }
+    if ($agentName) { $evidence['agentName'] = $agentName }
+    if ($packageId) { $evidence['packageId'] = $packageId }
+    if ($packageUri) { $evidence['packageUri'] = $packageUri }
+    if ($record) { $evidence['releaseId'] = $record['releaseId'] }
+    if ($recordPath) { $evidence['releaseRecordPath'] = $recordPath }
+    if ($rollbackArtifact) { $evidence['rollbackArtifactPath'] = $rollbackArtifact }
+    if ($failureMessage) { $evidence['failure'] = $failureMessage }
+    if ($mutationStarted -and -not $rollbackArtifact) {
+        $evidence['recoveryAction'] = "No prior package exists. Deploy a known-good package explicitly to '$Environment' with import-agent.ps1, then run the required gates; do not attest this failed release."
+    }
+    Write-JsonFile -InputObject $evidence -Path $DeploymentEvidencePath -Depth 8 -Confirm:$false -WhatIf:$false | Out-Null
+}
 
 try {
     Write-OpsLog -Level Step -Message "Verifying package integrity and identity"
@@ -112,7 +174,7 @@ try {
     }
 
     Write-OpsLog -Level Step -Message "Loading environment configuration for '$Environment'"
-    $config = Get-EnvironmentConfig -Environment $Environment -ConfigRoot $ConfigRoot
+    $config = Get-EnvironmentConfig -Environment $Environment -ConfigRoot $ConfigRoot -RuntimeVariable $RuntimeVariable
 
     # Change record is a runtime value, never a packaged default.
     $governancePolicy = $config['governance']
@@ -131,6 +193,23 @@ try {
     }
     elseif ($ChangeRecordId) {
         $RuntimeVariable['CHANGE_RECORD_ID'] = $ChangeRecordId
+    }
+
+    if ($BusinessSignoffId -and $BusinessSignoffId -notmatch '^BSO-[0-9]{4,10}$') {
+        throw "BusinessSignoffId '$BusinessSignoffId' is invalid. Expected BSO- followed by 4-10 digits, for example BSO-0043912."
+    }
+    if ($Environment -eq 'prod') {
+        if ([string]::IsNullOrWhiteSpace($BusinessSignoffId)) {
+            throw "Environment 'prod' requires durable UAT business acceptance. Supply -BusinessSignoffId in the format BSO-0043912."
+        }
+        $raiReviewId = if ($descriptor['agent'].Contains('classification') -and $descriptor['agent']['classification']) {
+            [string]$descriptor['agent']['classification']['responsibleAiReviewId']
+        }
+        else { '' }
+        if ([string]::IsNullOrWhiteSpace($raiReviewId)) {
+            throw "Environment 'prod' requires classification.responsibleAiReviewId in the immutable package."
+        }
+        Write-OpsLog -Level Success -Message "Business sign-off $BusinessSignoffId and Responsible AI review $raiReviewId accepted for production."
     }
 
     Write-OpsLog -Level Step -Message "Building the allowlisted runtime variable map"
@@ -164,9 +243,7 @@ try {
             Write-OpsLog -Level Info -Message "Overlay declares no Key Vault references."
         }
     }
-
     $foundry = $config['foundry']
-    $tenantId = if ($config['azure'].Contains('tenantId')) { [string]$config['azure']['tenantId'] } else { $null }
 
     if ($WhatIfPreference) {
         Write-OpsLog -Level Info -Message "WhatIf: would deploy to $($foundry['projectEndpoint']) (api-version $($foundry['apiVersion']))."
@@ -182,32 +259,60 @@ try {
         }
     }
 
-    $accessToken = Get-FoundryAccessToken -Scope $foundry['tokenScope'] -TenantId $tenantId
-
     if (-not $SkipPreflight) {
         Write-OpsLog -Level Step -Message "Running Agent Service preflight"
-        $null = Test-FoundryEndpoint -EnvironmentConfig $config -AccessToken $accessToken
+        $null = Test-FoundryEndpoint -EnvironmentConfig $config
     }
 
     Write-OpsLog -Level Step -Message "Locating existing managed agent '$agentName'"
     $previousRecord = Get-LatestReleaseRecord -EnvironmentConfig $config -AgentName $agentName -LocalFallbackDirectory $ReleaseDirectory
-    $knownAgentId = $null
-    if ($previousRecord -and $previousRecord['agent'].Contains('remoteAgentId')) {
-        $knownAgentId = [string]$previousRecord['agent']['remoteAgentId']
+    $existing = Get-FoundryAgent -EnvironmentConfig $config -LogicalName $agentName
+    if ($existing) {
+        Write-OpsLog -Level Success -Message "Managed agent found: $($existing.id) (latest version $($existing.latestVersion))."
     }
-
-    $existing = $null
-    if ($knownAgentId) {
-        try {
-            $existing = Get-FoundryAgent -EnvironmentConfig $config -LogicalName $agentName -KnownAgentId $knownAgentId -AccessToken $accessToken
-        }
-        catch [System.Management.Automation.RuntimeException] {
-            Write-OpsLog -Level Warning -Message "Recorded agent id '$knownAgentId' could not be read back; falling back to metadata discovery."
-            $existing = $null
+    else {
+        Write-OpsLog -Level Info -Message "Managed agent '$agentName' does not exist yet. A new agent will be created."
+    }
+    if ($Operation -eq 'rollback') {
+        if (-not $RollbackContextPath -or -not $RollbackTargetRecordPath) { throw 'Rollback imports require exact context and known-good release evidence. Use Invoke-Rollback.ps1.' }
+        $context = Read-ReleaseRecordFile -Path $RollbackContextPath
+        $previousRecord = Read-ReleaseRecordFile -Path $RollbackTargetRecordPath
+        if ($context['environment'] -ne $Environment -or $context['agent']['name'] -cne $agentName -or
+            $context['previous']['releaseId'] -cne $previousRecord['releaseId'] -or
+            $previousRecord['packageId'] -cne $packageId -or
+            -not $existing -or $existing.activeVersion -cnotin @($context['agent']['serviceVersion'], $context['previous']['serviceVersion'])) {
+            throw 'Rollback context, target or serving version has drifted.'
         }
     }
-    if (-not $existing) {
-        $existing = Get-FoundryAgent -EnvironmentConfig $config -LogicalName $agentName -AccessToken $accessToken
+    elseif ($existing) {
+        for ($hop = 0; $hop -lt 20 -and $previousRecord; $hop++) {
+            if ($previousRecord['agent']['serviceVersion'] -ceq $existing.activeVersion -and
+                $previousRecord['deployment']['outcome'] -eq 'succeeded') { break }
+            if (-not $previousRecord.Contains('previous') -or -not $previousRecord['previous']['releaseId']) {
+                $previousRecord = $null; break
+            }
+            $previousRecord = Get-ReleaseRecordById -ReleaseId $previousRecord['previous']['releaseId'] `
+                -AgentName $agentName -EnvironmentConfig $config -LocalDirectory $ReleaseDirectory
+        }
+        if (-not $previousRecord -or $previousRecord['agent']['serviceVersion'] -cne $existing.activeVersion) {
+            throw 'Cannot reconcile the active service version to an attested prior release; latest.json is only an audit attempt.'
+        }
+    }
+    elseif ($previousRecord) {
+        throw 'Release history exists but the managed agent is absent. Explicit manual recovery is required.'
+    }
+    if ($previousRecord) {
+        if ($previousRecord['environment'] -ne $Environment -or $previousRecord['agent']['name'] -cne $agentName -or
+            $previousRecord['projectEndpoint'].TrimEnd('/').ToLowerInvariant() -cne $foundry['projectEndpoint'].TrimEnd('/').ToLowerInvariant() -or
+            $previousRecord['agent']['remoteAgentId'] -cne $existing.id -or
+            ($Operation -ne 'rollback' -and $previousRecord['agent']['serviceVersionId'] -cne $existing.versionId)) {
+            throw 'Prior attested release does not match the serving agent/environment/project identity.'
+        }
+        # Full packaged gate requirements are checked again once the retained package is staged below.
+        $priorCheck = Test-ReleaseRecordForPromotion -Record $previousRecord -AgentName $agentName `
+            -PackageId $previousRecord['packageId'] -SourceEnvironment $Environment `
+            -ExpectedGates $previousRecord['deployment']['attestation']['requiredGates']
+        if (-not $priorCheck.IsValid) { throw "Prior release is not known-good: $($priorCheck.Problems -join '; ')" }
     }
 
     # ---------------------------------------------------------------------------------------------
@@ -215,18 +320,18 @@ try {
     # only has the candidate package and cannot restore the previous state.
     # ---------------------------------------------------------------------------------------------
     $previous = [ordered]@{}
-    $rollbackArtifact = $null
-
     if ($previousRecord) {
         $previous['packageId'] = $previousRecord['packageId']
         $previous['agentVersion'] = $previousRecord['agent']['version']
         $previous['releaseId'] = $previousRecord['releaseId']
+        $previous['serviceVersion'] = $previousRecord['agent']['serviceVersion']
+        $previous['serviceVersionId'] = $previousRecord['agent']['serviceVersionId']
         if ($previousRecord.Contains('packageUri')) { $previous['packageUri'] = $previousRecord['packageUri'] }
     }
     if ($existing) { $previous['remoteAgentId'] = $existing.id }
 
     $rollbackMode = if ($config['deployment'].Contains('rollbackMode')) { [string]$config['deployment']['rollbackMode'] } else { 'redeploy-previous-package' }
-    $rollbackExpected = ($rollbackMode -eq 'redeploy-previous-package') -and $previousRecord -and ($previousRecord['packageId'] -ne $packageId)
+    $rollbackExpected = ($rollbackMode -eq 'redeploy-previous-package') -and $previousRecord
 
     if ($rollbackExpected) {
         Write-OpsLog -Level Step -Message "Staging the prior package so rollback is possible"
@@ -244,8 +349,26 @@ try {
                 Copy-Item -LiteralPath $found -Destination $staged -Force
             }
             $rollbackArtifact = $staged
+            $priorRoot = Join-Path $extractRoot 'prior'
+            try {
+                $verifiedPriorRoot = Expand-AgentPackage -PackagePath $staged -Destination $priorRoot
+                $priorDescriptor = Read-PackageDescriptor -PackageRoot $verifiedPriorRoot
+                if ($priorDescriptor['packageId'] -cne $previousRecord['packageId'] -or
+                    $priorDescriptor['agent']['name'] -cne $agentName -or
+                    $priorDescriptor['agent']['version'] -cne $previousRecord['agent']['version']) {
+                    throw 'Staged rollback package does not match the attested prior identity.'
+                }
+                $priorDefinition = Resolve-AgentDefinition -Path $verifiedPriorRoot -Environment $Environment -SkipPlaceholderExpansion
+                $priorCheck = Test-ReleaseRecordForPromotion -Record $previousRecord -AgentName $agentName `
+                    -PackageId $previousRecord['packageId'] -SourceEnvironment $Environment -ExpectedGates (Get-DeploymentGate -Definition $priorDefinition)
+                if (-not $priorCheck.IsValid) { throw "Retained release gate evidence is invalid: $($priorCheck.Problems -join '; ')" }
+            }
+            finally { if (Test-Path -LiteralPath $priorRoot) { Remove-Item -LiteralPath $priorRoot -Recurse -Force -Confirm:$false } }
+            $priorRecordPath = Join-Path $RollbackStageDirectory "$($previousRecord['releaseId']).json"
+            Write-JsonFile -InputObject $previousRecord -Path $priorRecordPath -Depth 32 -Confirm:$false -WhatIf:$false | Out-Null
             $previous['artifactRetained'] = $true
             $previous['rollbackArtifactPath'] = $staged
+            $previous['releaseRecordPath'] = $priorRecordPath
             Write-OpsLog -Level Success -Message "Prior package $($previousRecord['packageId']) staged at $staged"
         }
         elseif ($AllowMissingRollbackArtifact) {
@@ -268,35 +391,93 @@ try {
         return [pscustomobject]@{ AgentName = $agentName; Environment = $Environment; Outcome = 'simulated' }
     }
 
-    if ($existing) {
-        Write-OpsLog -Level Step -Message "Updating existing agent $($existing.id)"
-        $response = Invoke-FoundryApi -Endpoint $foundry['projectEndpoint'] -Path "/assistants/$($existing.id)" `
-            -ApiVersion $foundry['apiVersion'] -AccessToken $accessToken -Method POST -Body $payload
+    # Publication and prepared audit evidence are fallible and therefore complete before activation begins.
+    $packageFile = ConvertTo-AbsolutePath -Path $PackagePath
+    if (Test-Path -LiteralPath $packageFile -PathType Leaf) {
+        $packageUri = Publish-AgentPackage -PackagePath $packageFile -AgentName $agentName -PackageId $packageId -EnvironmentConfig $config -Confirm:$false
     }
-    else {
-        Write-OpsLog -Level Step -Message "Creating new agent '$agentName'"
-        $response = Invoke-FoundryApi -Endpoint $foundry['projectEndpoint'] -Path '/assistants' `
-            -ApiVersion $foundry['apiVersion'] -AccessToken $accessToken -Method POST -Body $payload
+    elseif ($config.Contains('packageStore') -and $config['packageStore']) {
+        throw "Package store publication requires an immutable package file. '$PackagePath' is a directory; deploy the verified zip so the exact bytes can be retained."
+    }
+    if ([string]::IsNullOrWhiteSpace($packageUri)) {
+        throw "Environment '$Environment' did not publish package '$packageId' to a target package store. Refusing to mutate runtime state without a durable target URI."
     }
 
-    $remoteAgentId = $response.Content.id
-    if ([string]::IsNullOrWhiteSpace($remoteAgentId)) {
-        throw "Agent Service returned HTTP $($response.StatusCode) without an 'id' field. Cannot record the deployment. Verify api-version '$($foundry['apiVersion'])'."
-    }
-    Write-OpsLog -Level Success -Message "Agent written to '$Environment' as $remoteAgentId"
-
-    # Publish to the content-addressed store so a future rollback does not depend on artifact retention.
-    if (-not $PackageUri) {
-        $packageFile = ConvertTo-AbsolutePath -Path $PackagePath
-        if (Test-Path -LiteralPath $packageFile -PathType Leaf) {
-            $PackageUri = Publish-AgentPackage -PackagePath $packageFile -AgentName $agentName -PackageId $packageId -EnvironmentConfig $config -Confirm:$false
-        }
+    $effectiveGateResult = [ordered]@{ validation = 'passed' }
+    if ($PSBoundParameters.ContainsKey('GateResult') -and $GateResult) {
+        $effectiveGateResult = Merge-Hashtable -Base $effectiveGateResult -Override $GateResult
     }
 
     $record = New-ReleaseRecord -Environment $Environment -PackageDescriptor $descriptor -Operation $Operation `
-        -Outcome 'pending-verification' -RemoteAgentId $remoteAgentId -SourceEnvironment $SourceEnvironment `
-        -GateResults @{ validation = 'passed' } -PackageUri $PackageUri -Previous $previous
+        -Outcome 'pending-verification' -SourceEnvironment $SourceEnvironment `
+        -GateResults $effectiveGateResult -PackageUri $packageUri -Previous $previous `
+        -ChangeRecordId $ChangeRecordId -BusinessSignoffId $BusinessSignoffId `
+        -OriginalChangeRecordId $OriginalChangeRecordId -RollbackReason $RollbackReason
+    $record['deployment']['runtimeMutation'] = [ordered]@{
+        started   = $false
+        completed = $false
+        stage     = 'prepared'
+    }
+    $record['projectEndpoint'] = $config['foundry']['projectEndpoint'].TrimEnd('/').ToLowerInvariant()
+    $recordPath = Join-Path $ReleaseDirectory "$($record['releaseId']).json"
     $recordPath = Save-ReleaseRecord -Record $record -EnvironmentConfig $config -LocalDirectory $ReleaseDirectory -Confirm:$false
+    Write-DeploymentEvidence
+
+    if ($TestFailurePoint -eq 'AfterPackagePublication') {
+        throw 'Simulated failure after target package publication and before runtime activation.'
+    }
+
+    Write-OpsLog -Level Step -Message "Creating agent version for '$agentName' through the Azure AI Projects SDK"
+    $record['deployment']['runtimeMutation']['started'] = $true
+    $record['deployment']['runtimeMutation']['stage'] = 'creating'
+    $record['deployment']['runtimeMutation']['startedAtUtc'] = [DateTime]::UtcNow.ToString('o')
+    $recordPath = Save-ReleaseRecord -Record $record -EnvironmentConfig $config -LocalDirectory $ReleaseDirectory -Confirm:$false
+    $mutationStarted = $true
+    Write-DeploymentEvidence
+    $createdVersion = New-FoundryAgentVersion -EnvironmentConfig $config -LogicalName $agentName -Payload $payload
+    Write-OpsLog -Level Success -Message "Created agent version $($createdVersion.version) for '$agentName'."
+
+    if ($createdVersion.PSObject.Properties.Name -contains 'agentId' -and $createdVersion.agentId) {
+        $record['agent']['remoteAgentId'] = [string]$createdVersion.agentId
+    }
+    if (-not $createdVersion.version -or -not $createdVersion.id) { throw 'create_version returned incomplete service identity; mutation may have occurred.' }
+    $record['agent']['serviceVersion'] = [string]$createdVersion.version
+    $record['agent']['serviceVersionId'] = [string]$createdVersion.id
+    $record['deployment']['runtimeMutation']['stage'] = 'created'
+    $record['deployment']['runtimeMutation']['candidateVersion'] = [string]$createdVersion.version
+    $recordPath = Save-ReleaseRecord -Record $record -EnvironmentConfig $config -LocalDirectory $ReleaseDirectory -Confirm:$false
+    Write-DeploymentEvidence
+    $record['deployment']['runtimeMutation']['stage'] = 'activating'
+    $recordPath = Save-ReleaseRecord -Record $record -EnvironmentConfig $config -LocalDirectory $ReleaseDirectory -Confirm:$false
+
+    Write-OpsLog -Level Step -Message "Promoting agent version $($createdVersion.version) to active"
+    $activation = Set-FoundryAgentActiveVersion -EnvironmentConfig $config -LogicalName $agentName -AgentVersion $createdVersion.version
+    if (-not $activation.ok -or $activation.activeVersion -cne $createdVersion.version) { throw 'Activation did not verify the candidate service version.' }
+    $mutationCompleted = $true
+    $record['deployment']['runtimeMutation']['completed'] = $true
+    $record['deployment']['runtimeMutation']['stage'] = 'activated'
+    $record['deployment']['runtimeMutation']['completedAtUtc'] = [DateTime]::UtcNow.ToString('o')
+    $recordPath = Save-ReleaseRecord -Record $record -EnvironmentConfig $config -LocalDirectory $ReleaseDirectory -Confirm:$false
+    Write-DeploymentEvidence
+
+    if ($TestFailurePoint -eq 'AfterActivation') {
+        throw 'Simulated failure after runtime activation.'
+    }
+
+    $refreshedAgent = Get-FoundryAgent -EnvironmentConfig $config -LogicalName $agentName
+    $remoteAgentId = if ($refreshedAgent -and $refreshedAgent.id) { [string]$refreshedAgent.id }
+    elseif ($createdVersion.PSObject.Properties.Name -contains 'agentId' -and $createdVersion.agentId) {
+        Write-OpsLog -Level Warning -Message "Could not re-read the promoted agent immediately; recording the agent id returned by the version creation call."
+        [string]$createdVersion.agentId
+    }
+    else { $null }
+    if ([string]::IsNullOrWhiteSpace($remoteAgentId)) {
+        throw "The Azure AI Projects SDK created and promoted a version for '$agentName', but the accelerator could not resolve the agent id to record the deployment."
+    }
+    Write-OpsLog -Level Success -Message "Agent written to '$Environment' as $remoteAgentId"
+    $record['agent']['remoteAgentId'] = $remoteAgentId
+    $recordPath = Save-ReleaseRecord -Record $record -EnvironmentConfig $config -LocalDirectory $ReleaseDirectory -Confirm:$false
+    Write-DeploymentEvidence
 
     Write-OpsLog -Level Warning -Message "Release $($record['releaseId']) is recorded as pending-verification. Run scripts/Complete-Release.ps1 after the post-deployment gates to attest it; promotion refuses an unattested release."
 
@@ -319,7 +500,7 @@ try {
         AgentName        = $agentName
         Version          = $agentVersion
         PackageId        = $packageId
-        PackageUri       = $PackageUri
+        PackageUri       = $packageUri
         Environment      = $Environment
         RemoteAgentId    = $remoteAgentId
         ReleaseId        = $record['releaseId']
@@ -329,9 +510,49 @@ try {
         Outcome          = 'pending-verification'
     }
 }
+catch {
+    $originalError = $_
+    $failureMessage = $originalError.Exception.Message
+
+    if ($record -and $config) {
+        $failedReleaseAttempted = $true
+        $record['deployment']['outcome'] = 'failed'
+        $record['deployment']['runtimeMutation']['started'] = $mutationStarted
+        $record['deployment']['runtimeMutation']['completed'] = $mutationCompleted
+        $record['deployment']['runtimeMutation']['stage'] = 'failed'
+        $record['deployment']['runtimeMutation']['failure'] = $failureMessage
+        $record['deployment']['attestation'] = [ordered]@{
+            gatesSatisfied = $false
+            attestedAtUtc  = [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')
+            attestedBy     = if ($env:GITHUB_ACTOR) { "github:$env:GITHUB_ACTOR" } elseif ($env:BUILD_REQUESTEDFOR) { "azuredevops:$env:BUILD_REQUESTEDFOR" } else { "local:$([Environment]::UserName)" }
+            requiredGates  = [ordered]@{
+                requireEvaluationPass  = [bool]$gates['requireEvaluationPass']
+                requireSmokeTestPass   = [bool]$gates['requireSmokeTestPass']
+                requireRegressionPass  = [bool]$gates['requireRegressionPass']
+                minimumEvaluationScore = $gates['minimumEvaluationScore']
+            }
+            evidence       = [ordered]@{}
+        }
+        try {
+            $recordPath = Save-ReleaseRecord -Record $record -EnvironmentConfig $config -LocalDirectory $ReleaseDirectory -Confirm:$false
+            $failedReleaseRecorded = $true
+        }
+        catch {
+            $failedReleaseRecorded = [bool]($recordPath -and (Test-Path -LiteralPath $recordPath -PathType Leaf))
+            Write-OpsLog -Level Error -Message "Failed release evidence could not be fully published: $($_.Exception.Message)"
+        }
+    }
+
+    try { Write-DeploymentEvidence }
+    catch { Write-OpsLog -Level Error -Message "Deployment evidence could not be written: $($_.Exception.Message)" }
+
+    if ($mutationStarted -and -not $rollbackArtifact) {
+        Write-OpsLog -Level Error -Message "Runtime activation may have changed '$Environment', but this is the first deployment and no prior package exists. Deploy a known-good package explicitly with import-agent.ps1 and run all required gates."
+    }
+    throw $originalError
+}
 finally {
-    if ($accessToken) { $accessToken.Dispose() }
-    if ($cleanupRequired -and (Test-Path -LiteralPath $extractRoot)) {
+    if (Test-Path -LiteralPath $extractRoot) {
         Remove-Item -LiteralPath $extractRoot -Recurse -Force -ErrorAction SilentlyContinue -WhatIf:$false -Confirm:$false
     }
 }

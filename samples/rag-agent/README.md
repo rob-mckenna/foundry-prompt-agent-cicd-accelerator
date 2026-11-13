@@ -1,7 +1,7 @@
 # Sample: RAG agent
 
-A retrieval augmented agent that grounds every answer in an Azure AI Search index plus documents uploaded to
-the project vector store.
+A retrieval augmented configuration intended to ground answers in an Azure AI Search index plus documents
+uploaded to the project vector store. Grounding is a behaviour to evaluate, not an assurance from packaging.
 
 | Property | Value |
 | --- | --- |
@@ -32,12 +32,15 @@ Per environment:
    /subscriptions/<sub>/resourceGroups/<rg>/providers/Microsoft.CognitiveServices/accounts/<account>/projects/<project>/connections/kb-search
    ```
 
-   Change the connection name `kb-search` in the overlays if yours differs.
+   Change the connection name `kb-search` in the overlays if yours differs. Connections can use Entra
+   authentication and can be managed through IaC, but these templates do not create them.
 3. A project vector store if you use `uploaded-documents`. Set `VECTOR_STORE_ID` as a pipeline variable or in
    the overlay `variables` map. It is intentionally left unbound in the sample so that a missing value fails
    loudly rather than deploying an empty store.
 4. The deployment identity needs `Azure AI User` on the project and the search service needs a role
    assignment for the project managed identity (`Search Index Data Reader`).
+5. Model deployments named by the overlays, with model versions, regional support and retirement dates
+   qualified for your use. Sample names are not current lifecycle guarantees.
 
 ## Index lifecycle
 
@@ -51,20 +54,31 @@ Indexes are data, not application code, so they are out of scope for the agent p
 | Agent definition and tool binding | agent team | this repository |
 
 Version index names (`kb-prod-v3`) and change the overlay to point at a new version. That makes an index
-change a reviewable, promotable, revertible change to the agent package.
+binding change reviewable and promotable. Reverting the binding does not restore mutable index content or
+freeze model behaviour; retain and govern knowledge snapshots separately.
 
 ## Try it locally
 
 ```powershell
-./scripts/Invoke-Validation.ps1
-./scripts/New-AgentPackage.ps1 -AgentPath ./samples/rag-agent -OutputDirectory ./out
-./scripts/import-agent.ps1 -PackagePath ./out/kb-research-agent-1.4.0+<sha>.zip -Environment test -WhatIf
+$ErrorActionPreference = 'Stop'
+$package = .\scripts\New-AgentPackage.ps1 -AgentPath .\samples\rag-agent -OutputDirectory .\out\rag-quickstart
+.\scripts\Test-AgentPackage.ps1 -PackagePath $package.PackagePath -Environment dev
+# Placeholder IDs for structural resolution only; no Azure call is made.
+$env:AZURE_SUBSCRIPTION_ID = '00000000-0000-0000-0000-000000000000'
+$env:AZURE_TENANT_ID = '11111111-1111-1111-1111-111111111111'
+.\scripts\import-agent.ps1 -PackagePath $package.PackagePath -Environment dev `
+  -RuntimeVariable @{ VECTOR_STORE_ID = 'vs-placeholder' } -WhatIf
 ```
+
+Run from the repository root. Plain `-WhatIf` is not a service/tool check; it needs no Python or credentials.
+Replace the dummy identifiers with your own before real operations.
+Real deployment and live tests use the [pinned SDK bridge](../../scripts/README.md), with explicit preview
+opt-in for agent-bound runtime. **No authenticated Azure qualification has been performed for this tranche.**
 
 ## Grounding gate
 
-`evaluations/grounding.evaluation.json` is referenced by the manifest and required from TEST onward. The
-overlays raise the bar as the package advances:
+`evaluations/grounding.evaluation.json` is referenced by the manifest; required evidence comes from the
+packaged overlay. The overlays raise the bar as the package advances:
 
 | Environment | Evaluation gate | Minimum score |
 | --- | --- | --- |
@@ -73,4 +87,7 @@ overlays raise the bar as the package advances:
 | UAT | required | 0.90 |
 | PROD | required | 0.90 |
 
-A retrieval change that lowers grounding quality is blocked at TEST, before a human ever reviews it.
+Import/promotion returns `pending-verification`. Run required live gates with the exact returned
+`-ReleaseRecordPath`, then call `Complete-Release.ps1`; failing evidence prevents successful attestation
+and onward promotion, not initial candidate exposure. Offline fixtures cannot satisfy those gates. See
+[the release sequence](../../scripts/README.md). Approval timing is configured externally in your CI system.

@@ -9,8 +9,8 @@ so the message text is the fastest way to find the right entry.
 
 **Symptom.** Deployment stops before contacting Azure.
 
-**Cause.** A `${env:...}` placeholder has no value in the overlay `variables` map and no matching process
-environment variable.
+**Cause.** A `${env:...}` placeholder has no value in the overlay `variables` map or the target
+configuration's allowlisted runtime-variable map. There is no unrestricted process-environment fallback.
 
 **Fix.** Find where the placeholder is used and decide where the value belongs.
 
@@ -19,9 +19,13 @@ Select-String -Path ./agents/<agent> -Pattern '\$\{env:X\}' -Recurse
 ```
 
 - Environment-specific and non-secret: add it to `variables` in each overlay.
-- Supplied by the pipeline: set it as an environment variable in the job. The samples expect
-  `AZURE_SUBSCRIPTION_ID`, and the PROD overlays expect `CHANGE_RECORD_ID`.
+- Supplied at runtime: declare its name in the target configuration's `runtime.allowedVariables`, then
+  supply it through import's `-RuntimeVariable` map or the matching process variable. Explicit map values
+  take precedence. Environment configuration and agent placeholders use this same allowlisted input.
+  The samples use identifiers such as `AZURE_SUBSCRIPTION_ID` and `AZURE_TENANT_ID`; PROD also uses
+  `CHANGE_RECORD_ID`.
 - Secret: it does not belong in `variables`. Use `secretRefs` with a Key Vault reference.
+  Credential-like runtime-variable names remain rejected even if allowlisted.
 
 The deployment fails rather than substituting an empty string, which is what stops a production agent from
 binding to a nonexistent index.
@@ -55,7 +59,7 @@ $config = Get-EnvironmentConfig -Environment prod -SkipPlaceholderExpansion
 
 ---
 
-## TS-03 `Agent Service call failed: GET /assistants returned HTTP 404`
+## TS-03 `Foundry SDK preflight failed before deployment`
 
 **Symptom.** The preflight fails before any write.
 
@@ -70,9 +74,11 @@ $config = Get-EnvironmentConfig -Environment prod -SkipPlaceholderExpansion
    Not the portal URL, not the management plane resource id, not the account endpoint without
    `/api/projects/<project>`.
 
-2. **`apiVersion` does not match the project.** The Agent Service has shipped under several api-versions with
-   different paths and response shapes. Confirm the value with your Foundry project, then update
-   `config/environments/<env>.json`.
+2. **Python 3.10+ or the pinned SDK dependencies are missing on the runner or workstation.**
+
+   ```powershell
+   python -m pip install -r ./scripts/python/requirements.txt
+   ```
 
 3. **The project does not exist**, or the account was created without `allowProjectManagement`.
 
@@ -83,6 +89,10 @@ az cognitiveservices account show --name <account> --resource-group <rg> --query
 ```
 
 The preflight exists precisely so that this becomes a clear failure rather than a partially configured agent.
+It does not validate `apiVersion`: the SDK selects its own service version. That configuration setting
+remains relevant to legacy `export-agent.ps1 -RemoteAgentId`, not to SDK Conversations/Responses tests.
+Preflight success is not proof of inference or tool execution. No authenticated Azure qualification is
+claimed by this repository's offline validation.
 
 ---
 
@@ -114,8 +124,8 @@ managed identity, not the deployment identity, reads your knowledge sources at r
 
 **Symptom.** Deployment refuses to start.
 
-**Cause.** A file inside the package changed after it was built, or `package.json` no longer matches the files
-on disk.
+**Cause.** Content/checksums, descriptor-bound identity, inventory or manifest/descriptor consistency failed.
+New packages use `/2`; strict `/1` verification is retained without a checksum-only fallback.
 
 **Common non-malicious causes.**
 
@@ -125,6 +135,12 @@ on disk.
 - Two different artifacts were mixed in the same folder.
 
 **Fix.** Do not patch the package. Rebuild from source, or download the original artifact again.
+If an old malformed `/1` package fails, do not disable descriptor verification or rewrite its ID; build a
+new `/2` package through the normal release path.
+
+An existing-blob archive-byte conflict is different: `/2` reproducibility guarantees the same ID for stable
+inputs, not identical ZIP metadata or volatile provenance. Reuse the retained original archive; never
+overwrite a same-ID blob with different ZIP bytes.
 
 ```powershell
 ./scripts/Test-AgentPackage.ps1 -PackagePath ./artifacts/<pkg>   # lists missing, extra and modified files
@@ -143,11 +159,12 @@ on disk.
 3. The artifact was downloaded to a different path than `-ArtifactDirectory`.
 
 **Why it does not just rebuild.** A rebuild is not the artifact that was verified in the source environment.
-Promoting or rolling back to a rebuild would silently break the guarantee that production runs what UAT
-tested.
+Promoting or rolling back to a rebuild would break original-archive promotion. This does not imply identical
+runtime behaviour: target overlays and external state differ. Rollback also needs the exact retained
+known-good release JSON, not just its ZIP.
 
 ```powershell
-# What does the source environment say it is running?
+# Inspect audit history; verify active service routing separately.
 Get-Content ./out/releases/<agent>-uat-*.json | ConvertFrom-Json |
   Select-Object releaseId, packageId, @{n='previous';e={$_.previous.packageId}} | Format-List
 ```
@@ -169,9 +186,11 @@ az storage blob list --account-name <storage> --container-name agent-releases `
   --prefix '<agent>/<env>/' --auth-mode login --output table
 ```
 
-Deployment still works without a release record: `Get-FoundryAgent` falls back to metadata discovery using
-`managed_by` and `logical_name`. Promotion and rollback do not, because they need to know which exact package
-was deployed.
+Discovery can read an agent by logical name without a record, but an existing agent is not thereby a
+known-good rollback target. Forward deployment must reconcile its pinned serving version to an attested
+same-agent/environment/package record before mutation. A missing agent permits first deployment; an existing
+untracked agent needs explicit reconciliation. Promotion and rollback require retained verified release
+evidence. `latest.json` names the latest audit attempt, which may be failed or pending, not serving state.
 
 ---
 
@@ -188,18 +207,22 @@ dropped tool is a production incident waiting to happen.
 
 ---
 
-## TS-09 Smoke test fails with `Environment metadata matches target :: expected 'prod', found 'uat'`
+## TS-09 Smoke test fails with missing version or environment metadata
 
-**Symptom.** The deployment succeeded but the agent reports the wrong environment.
+**Symptom.** The SDK created and promoted a version, but smoke reports `agent_version` or `environment` as
+`<absent>`.
 
-**Cause.** The wrong overlay was applied, which almost always means `config/environments/<env>.json` for two
-environments points at the same `projectEndpoint`.
+**Cause.** The deployed version predates the version-level metadata mapping, the payload was created outside the
+accelerator, or the resolved overlay supplied incorrect metadata. `PromptAgentDefinition` does not contain
+metadata; the bridge passes it separately to `agents.create_version`.
 
-**Fix.** Check that every environment configuration has a distinct account, project and endpoint. Then
-redeploy with the correct target.
+**Fix.** Redeploy through the current bridge and confirm the resolved payload contains `logical_name`,
+`agent_version`, `environment`, and `managed_by`. Do not weaken the smoke check to an unconditional pass.
+Smoke checks the **active** pinned version, not `versions.latest`. `-ExpectedVersion` is manifest semver,
+whereas the release's `agent.serviceVersion` is an opaque SDK version; do not compare those as the same value.
 
-This check exists because a shared endpoint between TEST and PROD is easy to create by copy-paste and
-catastrophic in effect.
+If metadata is present but contains the wrong environment, then check that every environment configuration
+has a distinct account, project and endpoint.
 
 ---
 
@@ -231,8 +254,9 @@ foreach ($e in 'dev','test','uat','prod') {
 
 - Cold start on the first run after deployment. Warm the agent with one throwaway prompt before the suite.
 - A slow tool, typically a search index or an OpenAPI backend, not the model.
-- Throttling. `Invoke-FoundryApi` retries on HTTP 429 with exponential backoff, and the retry time counts
-  towards the measured latency. Look for `Agent Service returned HTTP 429` warnings in the log.
+- Throttling or slow SDK requests. The shared Conversations/Responses helper bounds HTTP calls and
+  nonterminal-response polling by the requested overall deadline; failures/timeouts cannot pass as completed
+  inference. Inspect the response status and error rather than assuming a classic REST retry policy.
 - The threshold is simply unrealistic for the model and tool set in that environment.
 
 Set `maximumP95LatencyMs` from measured behaviour, not aspiration. An evaluation gate that fails for
@@ -393,13 +417,53 @@ Check the environment's check history, not just the pipeline log: a rejected app
 
 ---
 
+## TS-21 Unsupported endpoint routing or service-version drift
+
+**Symptom.** Discovery, deployment, a live runner or attestation rejects the endpoint selector.
+
+**Cause.** Managed live operation supports only an enabled Responses endpoint with exactly one fixed
+concrete service version at 100%. Latest/dynamic, split, disabled and unknown routing are not silently
+normalized. `latestVersion` does not identify the serving version.
+
+**Fix.** Inspect the reported routing details. Deliberately pin a known version through the supported SDK
+activation operation and reconcile its attested release/package identity before deploying. Serialize
+deployment, testing and rollback under the same agent/environment lock. A stale rollback context must not
+undo a newer release; select the exact failed/current attempt, not an arbitrary newest JSON.
+Out-of-band concurrent routing edits are unsupported; before/after invocation checks detect observed drift,
+not every transient change.
+
+## TS-22 Gate evidence rejected despite passing local counters
+
+**Symptom.** `Complete-Release.ps1` persists a failed attestation even though a result reports passes.
+
+**Cause.** New attestable evidence must be live and bound to this release, package, agent, environment,
+normalized endpoint, manifest semver and service version. It must start after verified activation, finish
+after its start and not be future-dated; counters, detailed completed Response IDs and thresholds must agree.
+
+**Fix.** Pass the deployment result's exact `ReleaseRecord` path as `-ReleaseRecordPath` to every runner and
+produce new result files. Do not edit timestamps or reuse another attempt's evidence. Required smoke needs
+at least one successful live canary; `-SkipLiveRun`, no applicable canaries, fixtures, baseline-update mode,
+legacy/unbound results and missing files cannot authorize a live gate. A minimum evaluation score requires
+live evaluation evidence even when its boolean gate is false. Invalid supplied optional evidence also fails.
+
+The three runners share SDK Conversations/Responses; an assistant id is not a valid new invocation target.
+Unsupported tool/approval actions are failures, not fabricated tool results. The bridge explicitly opts into
+the documented agent-bound preview surface with `allow_preview=True`; offline SDK request capture is not
+proof that Azure accepts a specific endpoint/tool combination.
+
+Rollback is verified only after the prior package has a new service version and its target-overlay gates
+are attested. Missing prior package/release evidence or a failed first deployment requires explicit manual
+recovery; redeployment alone is not a successful rollback.
+
+---
+
 ## Diagnostic commands
 
 ```powershell
 # Full offline validation with detail
 ./scripts/Invoke-Validation.ps1 -Verbose
 
-# What exactly would be sent to an environment, no credentials used
+# Non-sensitive structural summary and payload digest, no credentials used
 ./scripts/import-agent.ps1 -PackagePath ./artifacts/<pkg> -Environment prod -WhatIf
 
 # Package contents and integrity
@@ -422,6 +486,6 @@ az account show --query '{subscription:name, tenant:tenantId, identity:user.name
 
 1. Read the error message. They are written to say what failed, what was expected and what to do next.
 2. Reproduce offline with `-WhatIf` and `-SkipPlaceholderExpansion`.
-3. Check the release record for the environment: it states exactly what is deployed.
+3. Check the exact release record and verify active routing: audit history alone is not proof of serving state.
 4. Open an issue with the command, the full error text, the environment, and the package id. Never paste
    tokens, connection strings or real endpoints.

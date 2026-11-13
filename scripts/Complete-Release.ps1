@@ -59,13 +59,15 @@ param(
 
     [string]$ReleaseDirectory,
 
+    [string]$EvaluationSuitePath,
+
     [switch]$RollbackOnFailure
 )
 
 Set-StrictMode -Version 3.0
 $ErrorActionPreference = 'Stop'
 
-Import-Module (Join-Path $PSScriptRoot 'modules/FoundryAgentOps/FoundryAgentOps.psd1') -Force
+Import-Module (Join-Path $PSScriptRoot 'modules/FoundryAgentOps/FoundryAgentOps.psd1')
 
 $repoRoot = Get-RepositoryRoot
 if (-not $ReleaseDirectory) { $ReleaseDirectory = Join-Path $repoRoot 'out/releases' }
@@ -77,25 +79,38 @@ $agentName = $record['agent']['name']
 if ($record['deployment']['outcome'] -ne 'pending-verification') {
     throw "Release $($record['releaseId']) has outcome '$($record['deployment']['outcome'])'. Complete-Release.ps1 only attests a release that is pending verification."
 }
-
-$extractRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("foundry-attest-" + [Guid]::NewGuid().ToString('n'))
+$config = Get-EnvironmentConfig -Environment $environment -ConfigRoot $ConfigRoot
+$evidence = @{}
+$gates = @{ requireSmokeTestPass = $true; requireEvaluationPass = $false; requireRegressionPass = $false; minimumEvaluationScore = $null }
+$validationFailure = $null
+$extractRoot = Join-Path $repoRoot ("out\platform-work\foundry-attest-" + [Guid]::NewGuid().ToString('n'))
 try {
     $packageRoot = Expand-AgentPackage -PackagePath $PackagePath -Destination $extractRoot
     $descriptor = Read-PackageDescriptor -PackageRoot $packageRoot
-    if ($descriptor['packageId'] -ne $record['packageId']) {
+    if ($descriptor['packageId'] -cne $record['packageId'] -or
+        $descriptor['agent']['name'] -cne $record['agent']['name'] -or $descriptor['agent']['version'] -cne $record['agent']['version']) {
         throw "Package '$($descriptor['packageId'])' does not match the package id '$($record['packageId'])' recorded in release $($record['releaseId'])."
     }
 
     $definition = Resolve-AgentDefinition -Path $packageRoot -Environment $environment -SkipPlaceholderExpansion
     $gates = Get-DeploymentGate -Definition $definition
 
+    $null = Get-FoundryReleaseTarget -ReleaseRecordPath $ReleaseRecordPath -EnvironmentConfig $config
     Write-OpsLog -Level Step -Message "Reading gate evidence for release $($record['releaseId'])"
-    $evidence = Read-GateEvidence -SmokeResultPath $SmokeResultPath -EvaluationResultPath $EvaluationResultPath -RegressionResultPath $RegressionResultPath
+    $evidence = Read-GateEvidence -SmokeResultPath $SmokeResultPath -EvaluationResultPath $EvaluationResultPath `
+        -RegressionResultPath $RegressionResultPath -ReleaseRecord $record -EnvironmentConfig $config
     foreach ($key in ($evidence.Keys | Sort-Object)) {
         Write-OpsLog -Level Info -Message "  $key : executed=$($evidence[$key].Executed) outcome=$($evidence[$key].Outcome) score=$($evidence[$key].Score)"
     }
 
     $verdict = Test-DeploymentGate -Definition $definition -Evidence $evidence
+}
+catch {
+    $validationFailure = $_.Exception.Message
+    $verdict = [pscustomobject]@{
+        IsSatisfied = $false; GateResults = @{ smoke = 'failed'; evaluation = 'failed'; regression = 'failed' }
+        Violations = @($validationFailure)
+    }
 }
 finally {
     if (Test-Path -LiteralPath $extractRoot) {
@@ -110,6 +125,8 @@ foreach ($key in ($evidence.Keys | Sort-Object)) {
         outcome  = [string]$evidence[$key].Outcome
         score    = $evidence[$key].Score
         source   = [string]$evidence[$key].Source
+        envelope = $evidence[$key].Envelope
+        resultSha256 = $evidence[$key].ResultSha256
     }
 }
 
@@ -131,11 +148,11 @@ $record['deployment']['attestation'] = [ordered]@{
     evidence       = $evidenceRecord
 }
 $record['deployment']['outcome'] = if ($verdict.IsSatisfied) { 'succeeded' } else { 'failed' }
+if ($validationFailure) { $record['deployment']['attestation']['failure'] = $validationFailure }
 
-$config = Get-EnvironmentConfig -Environment $environment -ConfigRoot $ConfigRoot
 if ($PSCmdlet.ShouldProcess($record['releaseId'], "Attest release as '$($record['deployment']['outcome'])'")) {
-    $null = Save-ReleaseRecord -Record $record -EnvironmentConfig $config -LocalDirectory $ReleaseDirectory -Confirm:$false
     Write-JsonFile -InputObject $record -Path $ReleaseRecordPath -Depth 16 -Confirm:$false -WhatIf:$false | Out-Null
+    $null = Save-ReleaseRecord -Record $record -EnvironmentConfig $config -LocalDirectory $ReleaseDirectory -Confirm:$false
 }
 
 $summaryRows = ($verdict.GateResults.Keys | ForEach-Object { "| $_ | $($verdict.GateResults[$_]) |" }) -join "`n"
@@ -173,10 +190,14 @@ if ($RollbackOnFailure) {
         & (Join-Path $PSScriptRoot 'Invoke-Rollback.ps1') `
             -AgentName $agentName `
             -Environment $environment `
+            -ReleaseRecordPath $ReleaseRecordPath `
+            -EvaluationSuitePath $EvaluationSuitePath `
             -ArtifactDirectory (Split-Path -Parent $priorArtifact) `
             -ToPackageId $record['previous']['packageId'] `
             -ConfigRoot $ConfigRoot `
             -ReleaseDirectory $ReleaseDirectory `
+            -ChangeRecordId ([string]$record['governance']['changeRecordId']) `
+            -BusinessSignoffId ([string]$record['governance']['businessSignoffId']) `
             -Reason "Automatic rollback: required gate(s) not satisfied - $($verdict.Violations -join '; ')" `
             -Confirm:$false
     }

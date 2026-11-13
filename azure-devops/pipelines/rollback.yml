@@ -32,6 +32,21 @@ parameters:
   - name: reason
     displayName: Reason for the rollback
     type: string
+  - name: changeRecordId
+    displayName: Approved rollback change reference (required for PROD)
+    type: string
+    default: ''
+  - name: businessSignoffId
+    displayName: Business acceptance reference BSO-######## (required for PROD)
+    type: string
+    default: ''
+  - name: evaluationSuitePath
+    displayName: Evaluation suite path (required when the target overlay requires evaluation)
+    type: string
+    default: ''
+  - name: releaseRecordPath
+    displayName: Exact failed/current release JSON path relative to Pipeline.Workspace
+    type: string
 
 variables:
   - template: templates/variables/common.yml
@@ -42,6 +57,7 @@ variables:
 
 stages:
   - stage: rollback
+    lockBehavior: sequential
     displayName: Roll back ${{ parameters.environmentName }}
     variables:
       - group: foundry-agents-${{ parameters.environmentName }}
@@ -56,11 +72,51 @@ stages:
               steps:
                 - checkout: self
 
+                - task: PowerShell@2
+                  displayName: Validate rollback governance inputs
+                  inputs:
+                    pwsh: true
+                    targetType: inline
+                    script: |
+                      Set-StrictMode -Version 3.0
+                      $ErrorActionPreference = 'Stop'
+                      if ([string]::IsNullOrWhiteSpace('${{ parameters.reason }}')) {
+                        throw 'A non-empty rollback reason is required and is persisted in the release record.'
+                      }
+                      if ('${{ parameters.environmentName }}' -eq 'prod') {
+                        if ('${{ parameters.changeRecordId }}' -notmatch '^[A-Za-z]{2,5}-[0-9]{4,10}$') {
+                          throw 'PROD rollback requires an approved changeRecordId such as CHG-0043912.'
+                        }
+                        if ('${{ parameters.businessSignoffId }}' -notmatch '^BSO-[0-9]{4,10}$') {
+                          throw 'PROD rollback requires a durable businessSignoffId such as BSO-0043912.'
+                        }
+                      }
+
+                - task: UsePythonVersion@0
+                  displayName: Use Python 3.11
+                  inputs:
+                    versionSpec: '3.11'
+
+                - task: PowerShell@2
+                  displayName: Install pinned Foundry SDK dependencies
+                  inputs:
+                    pwsh: true
+                    targetType: inline
+                    workingDirectory: $(Build.SourcesDirectory)
+                    script: |
+                      Set-StrictMode -Version 3.0
+                      $ErrorActionPreference = 'Stop'
+                      python -m pip install --disable-pip-version-check -r scripts/python/requirements.txt
+
                 - download: sourcePipeline
                   artifact: agentPackage
                   displayName: Download retained packages
+                - download: sourcePipeline
+                  artifact: releaseRecords-${{ parameters.environmentName }}
+                  displayName: Download exact release context and known-good evidence
 
                 - task: AzureCLI@2
+                  name: executeRollback
                   displayName: Roll back
                   inputs:
                     azureSubscription: foundry-agents-${{ parameters.environmentName }}
@@ -79,27 +135,24 @@ stages:
                         ArtifactDirectory = '$(Pipeline.Workspace)'
                         ReleaseDirectory  = '$(Build.ArtifactStagingDirectory)/releases'
                         Reason            = '${{ parameters.reason }}'
+                        ChangeRecordId    = '${{ parameters.changeRecordId }}'
+                        BusinessSignoffId = '${{ parameters.businessSignoffId }}'
+                        ReleaseRecordPath = '$(Pipeline.Workspace)/${{ parameters.releaseRecordPath }}'
+                        EvaluationSuitePath = '${{ parameters.evaluationSuitePath }}'
                         Confirm           = $false
                       }
                       if ('${{ parameters.toPackageId }}' -ne '') { $parameters['ToPackageId'] = '${{ parameters.toPackageId }}' }
-                      ./scripts/Invoke-Rollback.ps1 @parameters
-
-                - task: AzureCLI@2
-                  displayName: Smoke test the rolled-back agent
-                  inputs:
-                    azureSubscription: foundry-agents-${{ parameters.environmentName }}
-                    scriptType: pscore
-                    scriptLocation: inlineScript
-                    workingDirectory: $(Build.SourcesDirectory)
-                    inlineScript: |
-                      Set-StrictMode -Version 3.0
-                      $ErrorActionPreference = 'Stop'
-                      $env:AZURE_SUBSCRIPTION_ID = '$(azureSubscriptionId)'
-                      $env:AZURE_TENANT_ID = '$(azureTenantId)'
-                      ./tests/smoke/Invoke-SmokeTest.ps1 `
-                        -Environment '${{ parameters.environmentName }}' `
-                        -AgentName '${{ parameters.agentName }}' `
-                        -ResultPath '$(Build.ArtifactStagingDirectory)/releases/smoke-rollback.json'
+                      $commandOutput = @(./scripts/Invoke-Rollback.ps1 @parameters)
+                      $commandOutput | Write-Output
+                      $result = @($commandOutput | Where-Object {
+                          $_.PSObject.Properties.Name -contains 'ReleaseRecord'
+                        }) | Select-Object -Last 1
+                      if (-not $result) {
+                        throw 'Rollback completed without returning the deployment result contract.'
+                      }
+                      Write-Host "##vso[task.setvariable variable=rollbackReleaseRecordPath]$($result.ReleaseRecord)"
+                      Write-Host "##vso[task.setvariable variable=rollbackPackagePath]$($result.PackagePath)"
+                      Write-Host '##vso[task.setvariable variable=rollbackChanged]true'
 
                 - publish: $(Build.ArtifactStagingDirectory)/releases
                   artifact: rollbackRecords-${{ parameters.environmentName }}-$(Build.BuildId)

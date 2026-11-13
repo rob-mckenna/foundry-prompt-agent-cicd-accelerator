@@ -20,7 +20,7 @@ flowchart TB
         A["Instructions, tool references, owner,<br/>classification, default model, version"]
     end
     subgraph L2["2. Environment overlay - shipped in the package"]
-        B["Model deployment, temperature, index names,<br/>which tools are enabled, Key Vault references,<br/>metadata, gate thresholds"]
+        B["Model deployment, temperature, index names,<br/>which tools are enabled, Key Vault validation refs,<br/>governance metadata, gate thresholds"]
     end
     subgraph L3["3. Environment configuration - repository, not packaged"]
         C["Project endpoint, api-version, token scope,<br/>Key Vault name, release store,<br/>governance policy, approval policy"]
@@ -74,7 +74,7 @@ because it describes the platform rather than the agent, and because the platfor
 | Objects | Deep merged. `model.parameters.temperature` can be overridden without restating `topP`. |
 | Arrays and scalars | Replaced wholesale. An overlay can shrink a list. |
 | `toolOverrides` | Keyed by tool `id`, deep merged into `config`. An override for an unknown id is an error, so a renamed tool cannot leave a dead override behind. |
-| `metadata` | Merged over the manifest metadata. |
+| `metadata` | Merged over manifest metadata for governance and passed as the version-level `metadata` argument to `agents.create_version` (not embedded in `PromptAgentDefinition`). |
 | Disabled tools | Removed from the resolved definition entirely. They produce no payload entry and require none of their placeholders in that environment. |
 
 ### Every environment needs an overlay
@@ -98,7 +98,7 @@ is how the samples compose a full connection id from `${env:AZURE_SUBSCRIPTION_I
 supplies and which is therefore never committed.
 
 ```powershell
-# See what a package would resolve to, without deploying and without credentials
+# See a non-sensitive structural summary and payload digest, without deploying or using credentials
 $env:AZURE_SUBSCRIPTION_ID = '<subscription guid>'
 ./scripts/import-agent.ps1 -PackagePath ./out/operations-copilot-2.1.0+ab12cd3.zip -Environment prod -WhatIf
 ```
@@ -116,16 +116,21 @@ pipeline variable or a command line argument.
 
 - The reference format is validated by the schema, so a malformed reference fails in the pull request.
 - `import-agent.ps1 -ValidateSecretReferences` reads each one before any write, proving the deployment
-  identity has `Key Vault Secrets User`. Values are held as `SecureString` and never printed.
+  identity has `Key Vault Secrets User`. Values are held as `SecureString` and never printed. This check runs
+  even with `-WhatIf`, so that combination is not offline.
+- The current payload/SDK bridge does not inject `secretRefs` into the deployed agent. Treat them as
+  preflight-only validation references; use a Foundry project connection for runtime credentials.
 - Prefer a Foundry project connection over an agent-held secret where the tool supports one: the connection
   keeps the credential entirely inside the platform.
 
 ### Rotation
 
 1. Add the new secret version to Key Vault.
-2. If the reference pins `SecretVersion`, update the overlay, bump the agent version and promote. If it does
-   not pin a version, the next run of the agent picks up the current version with no deployment.
-3. Disable the old version only after smoke tests pass in every environment that uses it.
+2. If the reference pins `SecretVersion`, update the overlay, bump the agent version and promote so the
+   validation reference changes under source control. If it does not pin a version, the next
+   `-ValidateSecretReferences` check reads the current version.
+3. Rotate the credential in the runtime Foundry project connection separately, then disable the old version
+   only after smoke tests pass in every environment that uses it.
 
 Pin `SecretVersion` when you need a rotation to be a reviewable, promotable change. Leave it unpinned when you
 need rotation to be operationally independent of the release cycle. Choose deliberately and be consistent.
@@ -140,7 +145,7 @@ need rotation to be operationally independent of the release cycle. Choose delib
 | `azure` | `resourceGroup`, `location` | Replace with your values. |
 | `foundry` | `accountName`, `projectName` | From the IaC outputs. |
 | `foundry` | `projectEndpoint` | `https://<account>.services.ai.azure.com/api/projects/<project>` |
-| `foundry` | `apiVersion` | Pinned explicitly. Verify against your project before the first deployment. |
+| `foundry` | `apiVersion` | Pinned only for retained legacy REST export-by-id. Live smoke, evaluation and regression use the SDK Conversations/Responses runtime; SDK runtime and preflight do not consume or validate this setting. |
 | `foundry` | `tokenScope` | Normally `https://ai.azure.com/.default`. |
 | `keyVault` | `name`, `uri` | Environment vault. |
 | `releaseStore` | `type`, `accountName`, `container` | `azureBlob` or `local`. |

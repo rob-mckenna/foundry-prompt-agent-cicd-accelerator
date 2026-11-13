@@ -1,0 +1,25 @@
+{
+  "provenance": {
+    "sourceCommit": "7c3776dc648aa827613981069826e1fec4410602",
+    "functions": [
+      "New-ChecksumManifest",
+      "ConvertTo-CanonicalJson",
+      "Get-PackageId"
+    ],
+    "generator": "isolated original HEAD functions; no current hash helper",
+    "culture": "en-US",
+    "descriptorReadBackBeforeHash": true
+  },
+  "packageId": "sha256:b49a085b9e610e70388160d60b1539f7066e19f3a814f7e5c0b966531c6ad3c0",
+  "builderBeforeReadbackId": "sha256:a276928d0f36a43149ec1dbac87120487d0e5d6a6f96f3649f3e47b7f2209d67",
+  "builderWithoutDescriptorId": "sha256:7f2af328730769b49b264d7c13b1942ed4cb3c36dbe0b914f3ae72f5ab5d9b83",
+  "contentManifest": "55d26e9c42aae08d4ae86396977d96ea0b7651ebc8f88ec1bb32e0a0ca762c5d  environments/dev.overlay.json\ne6a4d732596edb6b07dac027f1356a3b1dd5836ffbede1675b8be8c3c5d9eb7f  manifest/agent.manifest.json\n49f592baf6ba6ad424423022cea8aa9a35d0d05115d29b9a1b0f8dd5ade28d34  manifest/instructions.md\neaabf80d8aca9177a478088056ba33c3bc5392eb44fa54c9d8c64e4cce275d66  manifest/README.md\n",
+  "checksumManifest": "55d26e9c42aae08d4ae86396977d96ea0b7651ebc8f88ec1bb32e0a0ca762c5d  environments/dev.overlay.json\ne6a4d732596edb6b07dac027f1356a3b1dd5836ffbede1675b8be8c3c5d9eb7f  manifest/agent.manifest.json\n49f592baf6ba6ad424423022cea8aa9a35d0d05115d29b9a1b0f8dd5ade28d34  manifest/instructions.md\neaabf80d8aca9177a478088056ba33c3bc5392eb44fa54c9d8c64e4cce275d66  manifest/README.md\nf6b4ffde5fa8ff2ba2ff6b785bf4fa48525f18a061f2095c64d18031ababede1  package.json\n",
+  "files": {
+    "package.json": "{\r\n  \"schemaVersion\": \"1.0.0\",\r\n  \"packageFormat\": \"foundry-agent-package/1\",\r\n  \"packageId\": \"sha256:b49a085b9e610e70388160d60b1539f7066e19f3a814f7e5c0b966531c6ad3c0\",\r\n  \"agent\": {\r\n    \"name\": \"simple-support-agent\",\r\n    \"version\": \"1.0.0\",\r\n    \"owner\": {\r\n      \"team\": \"customer-experience-platform\",\r\n      \"contact\": \"cx-platform@contoso.example.com\",\r\n      \"costCenter\": \"CX-1042\",\r\n      \"supportUrl\": \"https://contoso.example.com/runbooks/support-assistant\"\r\n    },\r\n    \"classification\": {\r\n      \"dataSensitivity\": \"internal\",\r\n      \"businessCriticality\": \"medium\",\r\n      \"processesPersonalData\": false,\r\n      \"humanInTheLoop\": true,\r\n      \"responsibleAiReviewId\": \"RAI-2026-0187\"\r\n    }\r\n  },\r\n  \"build\": {\r\n    \"createdUtc\": \"2026-01-01T00:00:00Z\",\r\n    \"sourceCommit\": \"7c3776dc648aa827613981069826e1fec4410602\",\r\n    \"sourceRef\": \"refs/heads/legacy\",\r\n    \"sourceRepository\": \"local/strict-v1-fixture\",\r\n    \"buildRunId\": \"legacy-17\",\r\n    \"builder\": \"local\",\r\n    \"toolVersion\": \"1.0.0\"\r\n  },\r\n  \"contents\": {\r\n    \"manifest\": \"manifest/agent.manifest.json\",\r\n    \"instructions\": \"manifest/instructions.md\",\r\n    \"environments\": [\r\n      \"dev\"\r\n    ],\r\n    \"tools\": [],\r\n    \"evaluations\": []\r\n  },\r\n  \"checksumFile\": \"checksums.sha256\",\r\n  \"fileCount\": 5\r\n}",
+    "environments/dev.overlay.json": "{\n  \"$schema\": \"../../../schemas/environment-overlay.schema.json\",\n  \"schemaVersion\": \"1.0.0\",\n  \"environment\": \"dev\",\n  \"model\": {\n    \"deploymentName\": \"gpt-4o-mini\",\n    \"parameters\": {\n      \"temperature\": 0.3\n    }\n  },\n  \"variables\": {},\n  \"metadata\": {\n    \"environment\": \"dev\"\n  },\n  \"deploymentGates\": {\n    \"requireEvaluationPass\": false,\n    \"requireSmokeTestPass\": true,\n    \"requireRegressionPass\": false\n  }\n}\n",
+    "manifest/agent.manifest.json": "{\r\n  \"$schema\": \"../../schemas/agent-manifest.schema.json\",\r\n  \"schemaVersion\": \"1.0.0\",\r\n  \"name\": \"simple-support-agent\",\r\n  \"version\": \"1.0.0\",\r\n  \"displayName\": \"Contoso Support Assistant\",\r\n  \"description\": \"Answers common customer support questions about accounts, billing and delivery in plain language.\",\r\n  \"owner\": {\r\n    \"team\": \"customer-experience-platform\",\r\n    \"contact\": \"cx-platform@contoso.example.com\",\r\n    \"costCenter\": \"CX-1042\",\r\n    \"supportUrl\": \"https://contoso.example.com/runbooks/support-assistant\"\r\n  },\r\n  \"classification\": {\r\n    \"dataSensitivity\": \"internal\",\r\n    \"businessCriticality\": \"medium\",\r\n    \"processesPersonalData\": false,\r\n    \"humanInTheLoop\": true,\r\n    \"responsibleAiReviewId\": \"RAI-2026-0187\"\r\n  },\r\n  \"model\": {\r\n    \"deploymentName\": \"gpt-4o-mini\",\r\n    \"modelFamily\": \"gpt-4o\",\r\n    \"parameters\": {\r\n      \"temperature\": 0.3,\r\n      \"topP\": 0.95\r\n    },\r\n    \"responseFormat\": {\r\n      \"type\": \"text\"\r\n    }\r\n  },\r\n  \"instructions\": {\r\n    \"file\": \"instructions.md\"\r\n  },\r\n  \"tools\": [],\r\n  \"metadata\": {\r\n    \"service\": \"customer-support\",\r\n    \"pattern\": \"simple-agent\"\r\n  }\r\n}",
+    "manifest/instructions.md": "Answer support questions honestly.\n",
+    "manifest/README.md": "Frozen strict /1 compatibility fixture.\n"
+  }
+}

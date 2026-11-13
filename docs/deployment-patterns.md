@@ -63,10 +63,11 @@ projects, change only `foundry.accountName` and `foundry.projectEndpoint` in the
 
 ## Pattern 3: deployment strategies
 
-### Direct replace (default)
+### Versioned replace (default)
 
-`import-agent.ps1` updates the existing agent in place. Simple, immediate, and correct when the calling
-application resolves the agent by its logical name through the release record.
+`import-agent.ps1` creates a fresh version under the logical agent name, then calls `agents.update_details`
+with a fixed-ratio selector that sends 100% of traffic to that version. It does not PATCH an assistant or
+overwrite a prior version.
 
 ### Side-by-side with a pinned id
 
@@ -78,10 +79,9 @@ Use this when the calling application pins an agent id and cannot tolerate an in
 
 ### Canary by traffic split
 
-The Agent Service has no built-in traffic split. Implement it in the calling application: read two agent ids
-from configuration and route a percentage to the candidate. The accelerator supports this by deploying two
-logical agents; the split itself is an application concern, not a deployment concern. Do not pretend a
-pipeline can do it.
+The accelerator does not configure a split: every promotion selects one version for 100% of traffic.
+Implement a canary in the calling application by deploying two logical agents and routing a percentage to the
+candidate.
 
 ## Pattern 4: what belongs in the manifest, the overlay, and the environment config
 
@@ -106,7 +106,7 @@ flowchart TB
 | Temperature | overlay | Tightened as the package advances |
 | Search index name, connection id | overlay `variables` | Environment-specific resources |
 | Which tools are enabled | overlay `toolOverrides` | Capability is restricted in higher environments |
-| API key or password | Key Vault, referenced from overlay `secretRefs` | Never in Git, never in the package |
+| API key or password | Foundry project connection; optional Key Vault `secretRefs` can validate readability only | Never in Git or the package; the current SDK bridge does not inject `secretRefs` |
 | Project endpoint, api-version, Key Vault name | environment config | Describes the platform, not the agent |
 | Allowed tool types, maximum sensitivity | environment config `governance` | Policy owned by the platform team |
 
@@ -123,9 +123,9 @@ flowchart TB
 | `type: function`, `config.name`, `config.parameters` | `tools[].function = { name, description, parameters }` |
 | `type: azure_function`, `config.inputQueue`, `config.outputQueue` | `tools[].azure_function = { function, input_binding, output_binding }` with `storage_queue` bindings |
 | `type: bing_grounding`, `config.connectionId` | `tools[].bing_grounding.search_configurations[]` |
-| `type: mcp`, `config.serverLabel`, `config.serverUrl`, `config.allowedTools` | `tools[].{ type, server_label, server_url, allowed_tools }` |
+| `type: mcp`, `config.serverLabel`, `config.serverUrl`, `config.allowedTools`, `config.requireApproval` | `tools[].{ type, server_label, server_url, allowed_tools, require_approval }` |
 
-Plus four metadata keys added to every agent, which is how the tooling recognises what it owns:
+The resolved payload also contains four management metadata keys:
 
 ```json
 "metadata": {
@@ -136,26 +136,27 @@ Plus four metadata keys added to every agent, which is how the tooling recognise
 }
 ```
 
-Agent Service metadata values must be strings and are limited to 16 pairs; the conversion enforces both.
+Agent Service metadata values must be strings and are limited to 16 pairs; the PowerShell conversion enforces
+both. Metadata and description are not fields on `PromptAgentDefinition`. The Python bridge correctly passes
+them as the supported `metadata` and `description` arguments to `agents.create_version`, while the definition
+contains only model, instructions, text format, sampling settings, and tools.
 
-## Pattern 6: idempotent create or update
+## Pattern 6: versioned create and promote
 
 ```mermaid
 flowchart TB
     S["Deploy starts"] --> R{"Release record for<br/>this agent and environment?"}
-    R -->|yes| ID["Read previous.remoteAgentId"]
-    R -->|no| SCAN
-    ID --> GET["GET /assistants/{id}"]
-    GET -->|found| UPD["POST /assistants/{id}"]
-    GET -->|not found| SCAN["List /assistants and match on<br/>metadata.managed_by + metadata.logical_name"]
-    SCAN -->|found| UPD
-    SCAN -->|not found| NEW["POST /assistants"]
-    UPD --> REC["Write release record with<br/>previous state for rollback"]
-    NEW --> REC
+    R -->|yes| PREV["Read previous release record"]
+    R -->|no| LOOKUP
+    PREV --> LOOKUP["SDK agents.get(logical name)"]
+    LOOKUP -->|found| VER["SDK agents.create_version"]
+    LOOKUP -->|not found| VER
+    VER --> ACT["SDK agents.update_details<br/>100% traffic to new version"]
+    ACT --> REC["Write pending-verification release record<br/>with previous state for rollback"]
 ```
 
-Agent Service display names are not unique, so discovery never relies on them. The recorded id is the fast
-path; metadata matching is the recovery path when the release store is unavailable or a record was lost.
+The SDK addresses agents by logical name, so deployments no longer scan `/assistants` or branch between
+create-vs-update writes. Every deployment creates a fresh version and then activates it immediately.
 
 ## Pattern 7: gating
 
@@ -180,6 +181,14 @@ Gates are declared per environment in the overlay and enforced by the pipeline.
 DEV deliberately does not roll back: a broken DEV deployment is information, and hiding it behind an automatic
 revert makes debugging harder.
 
+Deployments and promotions both write a `pending-verification` release record first.
+`scripts/Complete-Release.ps1` then reads the smoke/evaluation/regression evidence, updates
+`deployment.gateResults`, and flips the outcome to `succeeded` or `failed`. GitHub Actions runs that
+attestation step inside `_reusable-deploy.yml`, even after a test step fails. Missing, skipped, empty or failed
+required evidence produces a failed attestation and a failing job. The Azure DevOps deployment stage also
+invokes attestation automatically after its gate tests, including after a test failure. Manual flows must
+invoke it explicitly.
+
 ## Pattern 8: bringing an existing agent under control
 
 ```powershell
@@ -187,12 +196,18 @@ az login
 ./scripts/export-agent.ps1 -Environment dev -RemoteAgentId asst_0123456789 -OutputPath ./agents/legacy-agent
 ```
 
-The export is read-only against Azure. It writes a manifest, instructions, tool definitions, one overlay and
-`export-notes.md` listing everything that needs a human decision: environment-specific values replaced with
-placeholders, tool types with no exact mapping, missing owner and classification.
+The export is read-only against Azure. When you know the logical name, use `-AgentName`; the SDK reads the
+verified active version directly by name, not merely the latest version. `-RemoteAgentId` is the retained
+legacy REST fallback for portal-authored agents that can only be identified by opaque assistant id. Neither
+path is a lossless round trip. The export
+writes a manifest, instructions, best-effort tool definitions, one overlay and `export-notes.md` listing
+everything that needs a human decision: environment-specific values replaced with placeholders, tool types
+with no exact mapping, missing owner and classification.
 
-Complete the notes, create the remaining overlays, run validation, then deploy through the pipeline so that
-the recorded state and the running state converge.
+Complete the notes, create the remaining overlays, run validation, and merge the exported source through a
+reviewed pull request. Deploy the merged source through the pipeline so that the recorded state and the running
+state converge. Do not delete or disable the portal-authored version until the pipeline-created version is
+active and its release record and required smoke/gate evidence are attested.
 
 ## Pattern 9: operating several agents
 
@@ -211,6 +226,6 @@ the recorded state and the running state converge.
 | Rebuilding the package for each environment | Production runs bytes nobody tested | Promote the artifact |
 | Editing the agent in the portal to fix production | The repository and reality diverge silently | Fix in Git, redeploy; use `export-agent.ps1` if drift already happened |
 | One overlay per customer or tenant | Overlay count explodes and review becomes impossible | Keep four environments; make tenant differences runtime parameters of the calling application |
-| Secrets in overlay `variables` | They end up in the package and in Git | `secretRefs` with a Key Vault reference |
+| Secrets in overlay `variables` | They end up in the package and in Git | Use a Foundry project connection; use `secretRefs` only for the optional Key Vault readability preflight |
 | Skipping UAT because the change is small | Small changes to instructions cause the largest behaviour shifts | Use the promotion path; use `-AllowSkipEnvironment -Justification` only for a recorded exception |
 | `continue-on-error` on a gate | A gate that cannot fail is not a gate | Fix the test or remove it deliberately |

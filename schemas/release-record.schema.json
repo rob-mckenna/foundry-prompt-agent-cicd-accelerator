@@ -2,17 +2,206 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "$id": "https://github.com/foundry-prompt-agent-cicd-accelerator/schemas/release-record.schema.json",
   "title": "Release Record",
-  "description": "Deployment record written after every successful environment deployment. Stored outside the package so that the package stays immutable. Rollback reads the previous record to find the package to redeploy.",
+  "description": "Deployment record written for every environment deployment and updated with post-deployment attestation. Stored outside the package so that the package stays immutable. Rollback reads the previous record to find the package to redeploy.",
+  "definitions": {
+    "gateEvidence": {
+      "type": "object",
+      "required": ["executed", "outcome", "score", "source"],
+      "additionalProperties": false,
+      "properties": {
+        "executed": { "type": "integer", "minimum": 0 },
+        "outcome": { "enum": ["passed", "failed", "skipped"] },
+        "score": {
+          "type": ["number", "null"],
+          "minimum": 0,
+          "maximum": 1
+        },
+        "source": { "type": "string", "minLength": 1 },
+        "resultSha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+        "envelope": { "$ref": "#/definitions/liveEnvelope" }
+      }
+    },
+    "liveEnvelope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schemaVersion", "gate", "mode", "releaseId", "packageId", "agentName", "environment", "projectEndpoint", "agentVersion", "serviceVersion", "startedUtc", "executedUtc", "liveExecuted"],
+      "properties": {
+        "schemaVersion": { "const": "1.1.0" },
+        "gate": { "enum": ["smoke", "evaluation", "regression"] },
+        "mode": { "const": "live" },
+        "releaseId": { "type": "string", "minLength": 1 },
+        "packageId": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" },
+        "agentName": { "type": "string", "minLength": 1 },
+        "environment": { "enum": ["dev", "test", "uat", "prod"] },
+        "projectEndpoint": { "type": "string", "minLength": 1 },
+        "agentVersion": { "type": "string", "minLength": 1 },
+        "serviceVersion": { "type": "string", "minLength": 1 },
+        "startedUtc": { "type": "string", "format": "date-time" },
+        "executedUtc": { "type": "string", "format": "date-time" },
+        "liveExecuted": { "type": "integer", "minimum": 1 }
+      }
+    }
+  },
   "type": "object",
-  "required": ["schemaVersion", "releaseId", "environment", "packageId", "agent", "deployment"],
+  "required": ["schemaVersion", "releaseId", "environment", "packageId", "agent", "deployment", "governance"],
   "additionalProperties": false,
+  "allOf": [
+    {
+      "if": { "properties": { "schemaVersion": { "const": "1.1.0" } } },
+      "then": {
+        "required": ["projectEndpoint", "packageUri"],
+        "properties": {
+          "deployment": {
+            "required": ["runtimeMutation"],
+            "properties": {
+              "attestation": {
+                "properties": {
+                  "evidence": {
+                    "additionalProperties": {
+                      "required": ["envelope", "resultSha256"]
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "allOf": [{
+          "if": { "properties": { "deployment": { "properties": { "outcome": { "const": "succeeded" } } } } },
+          "then": {
+            "properties": {
+              "agent": { "required": ["remoteAgentId", "serviceVersion", "serviceVersionId"] },
+              "deployment": {
+                "properties": {
+                  "runtimeMutation": {
+                    "required": ["startedAtUtc", "completedAtUtc", "candidateVersion"],
+                    "properties": { "started": { "const": true }, "completed": { "const": true }, "stage": { "const": "activated" } }
+                  }
+                }
+              }
+            }
+          }
+        }]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "deployment": {
+            "properties": { "outcome": { "const": "succeeded" } },
+            "required": ["outcome"]
+          }
+        },
+        "required": ["deployment"]
+      },
+      "then": {
+        "properties": {
+          "deployment": {
+            "required": ["attestation"],
+            "properties": {
+              "attestation": {
+                "properties": {
+                  "gatesSatisfied": { "const": true },
+                  "evidence": { "minProperties": 1 }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "deployment": {
+            "properties": { "outcome": { "const": "failed" } },
+            "required": ["outcome"]
+          }
+        },
+        "required": ["deployment"]
+      },
+      "then": {
+        "properties": {
+          "deployment": {
+            "required": ["attestation"],
+            "properties": {
+              "attestation": {
+                "properties": { "gatesSatisfied": { "const": false } }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": { "environment": { "const": "prod" } },
+        "required": ["environment"]
+      },
+      "then": {
+        "properties": {
+          "governance": {
+            "required": ["changeRecordId", "businessSignoffId", "responsibleAiReviewId"]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "deployment": {
+            "properties": { "operation": { "const": "rollback" } },
+            "required": ["operation"]
+          }
+        },
+        "required": ["deployment"]
+      },
+      "then": {
+        "properties": {
+          "governance": {
+            "required": ["rollbackReason"]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "deployment": {
+            "properties": { "outcome": { "const": "rolled-back" } },
+            "required": ["outcome"]
+          }
+        },
+        "required": ["deployment"]
+      },
+      "then": {
+        "properties": {
+          "deployment": {
+            "properties": { "operation": { "const": "rollback" } }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "deployment": { "required": ["runtimeMutation"] }
+        },
+        "required": ["deployment"]
+      },
+      "then": {
+        "required": ["packageUri"]
+      }
+    }
+  ],
   "properties": {
     "$schema": { "type": "string" },
-    "schemaVersion": { "const": "1.0.0" },
+    "schemaVersion": { "enum": ["1.0.0", "1.1.0"] },
+    "projectEndpoint": { "type": "string", "minLength": 1 },
     "releaseId": { "type": "string", "minLength": 1, "description": "Unique id: <agent>-<environment>-<utc timestamp>-<short package hash>." },
     "environment": { "enum": ["dev", "test", "uat", "prod"] },
     "packageId": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" },
-    "packageUri": { "type": "string", "description": "Location the immutable package was retrieved from (artifact feed, blob or release asset)." },
+    "packageUri": { "type": "string", "description": "Target-environment content-addressed URI where the exact immutable package bytes were published before activation." },
     "agent": {
       "type": "object",
       "required": ["name", "version"],
@@ -20,13 +209,127 @@
       "properties": {
         "name": { "type": "string" },
         "version": { "type": "string" },
-        "remoteAgentId": { "type": "string", "description": "Agent Service assistant id in the target project." }
+        "remoteAgentId": { "type": "string", "minLength": 1, "description": "Logical SDK agent resource ID, not an assistant ID." },
+        "serviceVersion": { "type": "string", "minLength": 1 },
+        "serviceVersionId": { "type": "string", "minLength": 1 }
+      }
+    },
+    "governance": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "changeRecordId": {
+          "type": "string",
+          "pattern": "^[A-Za-z]{2,5}-[0-9]{4,10}$",
+          "description": "Approved change reference for this deployment or rollback."
+        },
+        "originalChangeRecordId": {
+          "type": "string",
+          "pattern": "^[A-Za-z]{2,5}-[0-9]{4,10}$",
+          "description": "Change reference on the release being replaced by a rollback."
+        },
+        "responsibleAiReviewId": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z][A-Za-z0-9._:/-]{2,127}$"
+        },
+        "businessSignoffId": {
+          "type": "string",
+          "pattern": "^BSO-[0-9]{4,10}$",
+          "description": "Durable UAT business acceptance reference required for production."
+        },
+        "rollbackReason": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2000
+        }
       }
     },
     "deployment": {
       "type": "object",
-      "required": ["deployedAtUtc", "deployedBy", "outcome"],
+      "required": ["deployedAtUtc", "deployedBy", "outcome", "operation"],
       "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "attestation": {
+                "properties": {
+                  "gatesSatisfied": { "const": true },
+                  "requiredGates": {
+                    "properties": { "requireSmokeTestPass": { "const": true } },
+                    "required": ["requireSmokeTestPass"]
+                  }
+                },
+                "required": ["gatesSatisfied", "requiredGates"]
+              }
+            },
+            "required": ["attestation"]
+          },
+          "then": {
+            "required": ["gateResults"],
+            "properties": {
+              "gateResults": {
+                "required": ["smoke"],
+                "properties": { "smoke": { "const": "passed" } }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "attestation": {
+                "properties": {
+                  "gatesSatisfied": { "const": true },
+                  "requiredGates": {
+                    "properties": { "requireEvaluationPass": { "const": true } },
+                    "required": ["requireEvaluationPass"]
+                  }
+                },
+                "required": ["gatesSatisfied", "requiredGates"]
+              }
+            },
+            "required": ["attestation"]
+          },
+          "then": {
+            "required": ["gateResults"],
+            "properties": {
+              "gateResults": {
+                "required": ["evaluation"],
+                "properties": { "evaluation": { "const": "passed" } }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "attestation": {
+                "properties": {
+                  "gatesSatisfied": { "const": true },
+                  "requiredGates": {
+                    "properties": { "requireRegressionPass": { "const": true } },
+                    "required": ["requireRegressionPass"]
+                  }
+                },
+                "required": ["gatesSatisfied", "requiredGates"]
+              }
+            },
+            "required": ["attestation"]
+          },
+          "then": {
+            "required": ["gateResults"],
+            "properties": {
+              "gateResults": {
+                "required": ["regression"],
+                "properties": { "regression": { "const": "passed" } }
+              }
+            }
+          }
+        }
+      ],
       "properties": {
         "deployedAtUtc": { "type": "string", "format": "date-time" },
         "deployedBy": { "type": "string", "description": "Pipeline identity name. Never a credential." },
@@ -37,6 +340,20 @@
         "operation": { "enum": ["deploy", "promote", "rollback"] },
         "sourceEnvironment": { "enum": ["dev", "test", "uat", "prod"] },
         "pipelineRunUrl": { "type": "string" },
+        "runtimeMutation": {
+          "type": "object",
+          "required": ["started", "completed", "stage"],
+          "additionalProperties": false,
+          "properties": {
+            "started": { "type": "boolean" },
+            "completed": { "type": "boolean" },
+            "stage": { "enum": ["prepared", "creating", "created", "activating", "activated", "failed"] },
+            "startedAtUtc": { "type": "string", "format": "date-time" },
+            "completedAtUtc": { "type": "string", "format": "date-time" },
+            "candidateVersion": { "type": "string", "minLength": 1 },
+            "failure": { "type": "string", "minLength": 1, "maxLength": 4000 }
+          }
+        },
         "approvals": {
           "type": "array",
           "items": {
@@ -60,6 +377,127 @@
             "regression": { "enum": ["passed", "failed", "skipped"] },
             "smoke": { "enum": ["passed", "failed", "skipped"] }
           }
+        },
+        "attestation": {
+          "type": "object",
+          "required": ["gatesSatisfied", "attestedAtUtc", "attestedBy", "requiredGates", "evidence"],
+          "additionalProperties": false,
+          "allOf": [
+            {
+              "if": {
+                "properties": {
+                  "gatesSatisfied": { "const": true },
+                  "requiredGates": {
+                    "properties": { "requireSmokeTestPass": { "const": true } },
+                    "required": ["requireSmokeTestPass"]
+                  }
+                },
+                "required": ["gatesSatisfied", "requiredGates"]
+              },
+              "then": {
+                "properties": {
+                  "evidence": {
+                    "required": ["smoke"],
+                    "properties": {
+                      "smoke": {
+                        "properties": {
+                          "executed": { "minimum": 1 },
+                          "outcome": { "const": "passed" },
+                          "source": { "minLength": 1 }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "if": {
+                "properties": {
+                  "gatesSatisfied": { "const": true },
+                  "requiredGates": {
+                    "properties": { "requireEvaluationPass": { "const": true } },
+                    "required": ["requireEvaluationPass"]
+                  }
+                },
+                "required": ["gatesSatisfied", "requiredGates"]
+              },
+              "then": {
+                "properties": {
+                  "evidence": {
+                    "required": ["evaluation"],
+                    "properties": {
+                      "evaluation": {
+                        "properties": {
+                          "executed": { "minimum": 1 },
+                          "outcome": { "const": "passed" },
+                          "source": { "minLength": 1 }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "if": {
+                "properties": {
+                  "gatesSatisfied": { "const": true },
+                  "requiredGates": {
+                    "properties": { "requireRegressionPass": { "const": true } },
+                    "required": ["requireRegressionPass"]
+                  }
+                },
+                "required": ["gatesSatisfied", "requiredGates"]
+              },
+              "then": {
+                "properties": {
+                  "evidence": {
+                    "required": ["regression"],
+                    "properties": {
+                      "regression": {
+                        "properties": {
+                          "executed": { "minimum": 1 },
+                          "outcome": { "const": "passed" },
+                          "source": { "minLength": 1 }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          ],
+          "properties": {
+            "gatesSatisfied": { "type": "boolean" },
+            "failure": { "type": "string", "minLength": 1 },
+            "attestedAtUtc": { "type": "string", "format": "date-time" },
+            "attestedBy": { "type": "string", "minLength": 1 },
+            "requiredGates": {
+              "type": "object",
+              "required": ["requireEvaluationPass", "requireSmokeTestPass", "requireRegressionPass", "minimumEvaluationScore"],
+              "additionalProperties": false,
+              "properties": {
+                "requireEvaluationPass": { "type": "boolean" },
+                "requireSmokeTestPass": { "type": "boolean" },
+                "requireRegressionPass": { "type": "boolean" },
+                "minimumEvaluationScore": {
+                  "type": ["number", "null"],
+                  "minimum": 0,
+                  "maximum": 1
+                }
+              }
+            },
+            "evidence": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "smoke": { "$ref": "#/definitions/gateEvidence" },
+                "evaluation": { "$ref": "#/definitions/gateEvidence" },
+                "regression": { "$ref": "#/definitions/gateEvidence" }
+              }
+            }
+          }
         }
       }
     },
@@ -67,12 +505,52 @@
       "type": "object",
       "description": "State replaced by this deployment. Used by scripts/Invoke-Rollback.ps1.",
       "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "required": ["artifactRetained"],
+            "properties": {
+              "artifactRetained": { "const": true }
+            }
+          },
+          "then": {
+            "required": ["packageId", "rollbackArtifactPath"]
+          }
+        },
+        {
+          "if": {
+            "required": ["artifactRetained"],
+            "properties": {
+              "artifactRetained": { "const": false }
+            }
+          },
+          "then": {
+            "not": { "required": ["rollbackArtifactPath"] }
+          }
+        },
+        {
+          "if": {
+            "required": ["rollbackArtifactPath"]
+          },
+          "then": {
+            "required": ["packageId", "artifactRetained"],
+            "properties": {
+              "artifactRetained": { "const": true }
+            }
+          }
+        }
+      ],
       "properties": {
-        "packageId": { "type": "string" },
+        "packageId": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" },
         "packageUri": { "type": "string" },
-        "agentVersion": { "type": "string" },
-        "remoteAgentId": { "type": "string" },
-        "releaseId": { "type": "string" }
+        "agentVersion": { "type": "string", "minLength": 1 },
+        "remoteAgentId": { "type": "string", "minLength": 1 },
+        "serviceVersion": { "type": "string", "minLength": 1 },
+        "serviceVersionId": { "type": "string", "minLength": 1 },
+        "releaseRecordPath": { "type": "string", "minLength": 1 },
+        "releaseId": { "type": "string", "minLength": 1 },
+        "artifactRetained": { "type": "boolean" },
+        "rollbackArtifactPath": { "type": "string", "minLength": 1 }
       }
     }
   }

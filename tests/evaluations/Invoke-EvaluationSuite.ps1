@@ -47,6 +47,8 @@ param(
 
     [string]$ResultPath,
 
+    [string]$ReleaseRecordPath,
+
     [switch]$ContinueOnThresholdFailure
 )
 
@@ -54,7 +56,7 @@ Set-StrictMode -Version 3.0
 $ErrorActionPreference = 'Stop'
 
 $moduleRoot = Join-Path (Split-Path -Parent (Split-Path -Parent $PSScriptRoot)) 'scripts/modules/FoundryAgentOps/FoundryAgentOps.psd1'
-Import-Module $moduleRoot -Force
+Import-Module $moduleRoot
 
 $repoRoot = Get-RepositoryRoot
 $suiteResolved = Resolve-RequiredPath -Path $SuitePath -Purpose 'Evaluation suite'
@@ -192,24 +194,22 @@ function Test-Evaluator {
     }
 }
 
-$accessToken = $null
+$startedUtc = [DateTime]::UtcNow.ToString('o')
+$target = $null
 $results = [System.Collections.Generic.List[pscustomobject]]::new()
 
 try {
     if ($mode -eq 'live') {
         $config = Get-EnvironmentConfig -Environment $Environment -ConfigRoot $ConfigRoot
-        $tenantId = if ($config['azure'].Contains('tenantId')) { [string]$config['azure']['tenantId'] } else { $null }
-        $accessToken = Get-FoundryAccessToken -Scope $config['foundry']['tokenScope'] -TenantId $tenantId
-
-        if (-not $AgentId) {
-            $record = Get-LatestReleaseRecord -EnvironmentConfig $config -AgentName $AgentName -LocalFallbackDirectory (Join-Path $repoRoot 'out/releases')
-            if ($record -and $record['agent'].Contains('remoteAgentId')) { $AgentId = [string]$record['agent']['remoteAgentId'] }
+        if ($AgentId) { throw 'Assistant-ID invocation is unsupported. Use logical agent name and an exact release record.' }
+        if ($ReleaseRecordPath) {
+            $target = Get-FoundryReleaseTarget -ReleaseRecordPath $ReleaseRecordPath -EnvironmentConfig $config
+            if ($target.Record['agent']['name'] -cne $AgentName) { throw 'Evaluation target identity mismatch.' }
+            $agent = $target.Agent
         }
-        if (-not $AgentId) {
-            $agent = Get-FoundryAgent -EnvironmentConfig $config -LogicalName $AgentName -AccessToken $accessToken
-            if (-not $agent) { throw "Agent '$AgentName' was not found in '$Environment'. Deploy it before running evaluations." }
-            $AgentId = $agent.id
-        }
+        else { $agent = Get-FoundryAgent -EnvironmentConfig $config -LogicalName $AgentName }
+        if (-not $agent) { throw "Agent '$AgentName' was not found in '$Environment'." }
+        $AgentId = $agent.id
         Write-OpsLog -Level Info -Message "Evaluating agent $AgentId in '$Environment' with suite '$($suite['id'])' ($($records.Count) records)."
     }
 
@@ -229,8 +229,8 @@ try {
             }
         }
         else {
-            $response = Invoke-FoundryAgentRun -EnvironmentConfig $config -AgentId $AgentId -Prompt $prompt `
-                -AccessToken $accessToken -TimeoutSeconds $timeoutSeconds
+            $response = Invoke-FoundryAgentRun -EnvironmentConfig $config -LogicalName $AgentName -AgentVersion $agent.activeVersion `
+                -Prompt $prompt -TimeoutSeconds $timeoutSeconds
         }
 
         $checks = @()
@@ -256,15 +256,16 @@ try {
                 LatencyMs = $response.LatencyMs
                 Passed    = (-not $recordFailed)
                 Checks    = $checks
+                Live = ($mode -eq 'live')
+                ResponseId = if ($mode -eq 'live') { $response.ResponseId } else { $null }
+                ConversationId = if ($mode -eq 'live') { $response.ConversationId } else { $null }
             })
 
         $marker = if ($recordFailed) { 'FAIL' } else { 'pass' }
         Write-Host ("  {0,-8} {1,-10} {2,6} ms  {3}" -f $marker, $id, $response.LatencyMs, (($checks | Where-Object Result -EQ 'failed' | ForEach-Object { "$($_.Evaluator): $($_.Message)" }) -join '; '))
     }
 }
-finally {
-    if ($accessToken) { $accessToken.Dispose() }
-}
+finally {}
 
 $passedCount = @($results | Where-Object Passed).Count
 $failedCount = $results.Count - $passedCount
@@ -290,7 +291,7 @@ $summary = [ordered]@{
     agentName    = $AgentName
     agentId      = $AgentId
     mode         = $mode
-    executedUtc  = [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')
+    executedUtc  = [DateTime]::UtcNow.ToString('o')
     total        = $results.Count
     passed       = $passedCount
     failed       = $failedCount
@@ -299,7 +300,16 @@ $summary = [ordered]@{
     thresholdsMet = ($violations.Count -eq 0)
     violations   = $violations
     records      = @($results)
+    schemaVersion = '1.1.0'
+    gate = 'evaluation'
+    startedUtc = $startedUtc
+    liveExecuted = if ($mode -eq 'live') { $results.Count } else { 0 }
+    thresholds = $thresholds
 }
+if ($target) {
+    foreach ($key in $target.Identity.Keys) { $summary[$key] = $target.Identity[$key] }
+}
+elseif ($mode -eq 'live') { $summary['mode'] = 'unbound' }
 
 if ($ResultPath) {
     Write-JsonFile -InputObject $summary -Path $ResultPath -Depth 12 -Confirm:$false | Out-Null

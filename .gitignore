@@ -46,6 +46,7 @@ local.settings.json
 # PowerShell
 *.psproj.user
 PesterTestResults.xml
+testResults.xml
 coverage.xml
 
 # Editors and operating systems

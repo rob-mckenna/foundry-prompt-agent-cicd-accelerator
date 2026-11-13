@@ -1,0 +1,5 @@
+# azure-ai-projects 2.7.0 publishes Python 3.10+ classifiers; keep the CI/runtime floor at 3.10+.
+azure-ai-projects==2.7.0
+azure-identity==1.26.0
+azure-core==1.41.0
+openai==3.17.0

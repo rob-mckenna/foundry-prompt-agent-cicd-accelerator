@@ -32,6 +32,7 @@ on:
 
 permissions:
   contents: read
+  id-token: write
 
 concurrency:
   group: deploy-dev-${{ inputs.agentPath || 'samples/simple-agent' }}

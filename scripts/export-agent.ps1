@@ -19,10 +19,11 @@
     Environment to read from.
 
 .PARAMETER AgentName
-    Logical agent name. Matches agents tagged with this accelerator's metadata.
+    Logical agent name. Prefer this when the accelerator-managed logical name is known.
 
 .PARAMETER RemoteAgentId
-    Agent Service assistant id. Use this for agents that were not created by this accelerator.
+    Agent Service assistant id. Use this only for agents that were not created by this accelerator and cannot
+    be resolved by logical name.
 
 .PARAMETER OutputPath
     Folder to create. Must not already contain agent.manifest.json unless -Force is supplied.
@@ -83,25 +84,25 @@ $config = Get-EnvironmentConfig -Environment $Environment -ConfigRoot $ConfigRoo
 $foundry = $config['foundry']
 $tenantId = if ($config['azure'].Contains('tenantId')) { [string]$config['azure']['tenantId'] } else { $null }
 
-$accessToken = $null
-try {
-    $accessToken = Get-FoundryAccessToken -Scope $foundry['tokenScope'] -TenantId $tenantId
+if ($PSCmdlet.ParameterSetName -eq 'ById') {
+    $accessToken = $null
+    try {
+        $accessToken = Get-FoundryAccessToken -Scope $foundry['tokenScope'] -TenantId $tenantId
 
-    if ($PSCmdlet.ParameterSetName -eq 'ById') {
         Write-OpsLog -Level Step -Message "Reading agent $RemoteAgentId from '$Environment'"
         $agent = Get-FoundryAgent -EnvironmentConfig $config -LogicalName '' -KnownAgentId $RemoteAgentId -AccessToken $accessToken
     }
-    else {
-        Write-OpsLog -Level Step -Message "Searching for managed agent '$AgentName' in '$Environment'"
-        $agent = Get-FoundryAgent -EnvironmentConfig $config -LogicalName $AgentName -AccessToken $accessToken
-    }
-
-    if (-not $agent) {
-        throw "No agent found in project '$($foundry['projectName'])' for the supplied identifier. Agents created outside this accelerator must be exported with -RemoteAgentId."
+    finally {
+        if ($accessToken) { $accessToken.Dispose() }
     }
 }
-finally {
-    if ($accessToken) { $accessToken.Dispose() }
+else {
+    Write-OpsLog -Level Step -Message "Reading managed agent '$AgentName' from '$Environment'"
+    $agent = Get-FoundryAgent -EnvironmentConfig $config -LogicalName $AgentName
+}
+
+if (-not $agent) {
+    throw "No agent found in project '$($foundry['projectName'])' for the supplied identifier. Agents created outside this accelerator must be exported with -RemoteAgentId."
 }
 
 $logicalName = if ($PSCmdlet.ParameterSetName -eq 'ByName') { $AgentName }
@@ -137,12 +138,28 @@ foreach ($tool in $agentTools) {
             $definition['config'] = [ordered]@{}
         }
         'file_search' {
+            $vectorStoreIds = Get-PropertyOrDefault -Object $tool -Name 'vector_store_ids' -Default @()
+            if ($vectorStoreIds.Count -eq 0 -and $toolResources -and ($toolResources.PSObject.Properties.Name -contains 'file_search')) {
+                $vectorStoreIds = Get-PropertyOrDefault -Object $toolResources.file_search -Name 'vector_store_ids' -Default @()
+            }
             $definition['config'] = [ordered]@{ vectorStoreIds = @('${env:VECTOR_STORE_ID}') }
-            $notes.Add("file_search vector store ids were replaced with `${env:VECTOR_STORE_ID}. Bind a real value per environment in the overlay variables map.")
+            if ($vectorStoreIds.Count -eq 0) {
+                $notes.Add("file_search tool '$id' did not expose any vector store ids through the SDK or legacy REST payload. Supply `${env:VECTOR_STORE_ID} manually per environment.")
+            }
+            else {
+                $notes.Add("file_search vector store ids were replaced with `${env:VECTOR_STORE_ID}. Bind a real value per environment in the overlay variables map.")
+            }
         }
         'azure_ai_search' {
             $indexConfig = $null
-            if ($toolResources -and ($toolResources.PSObject.Properties.Name -contains 'azure_ai_search')) {
+            $sdkIndexes = @()
+            if ($tool.PSObject.Properties.Name -contains 'azure_ai_search' -and $tool.azure_ai_search) {
+                $sdkIndexes = Get-PropertyOrDefault -Object $tool.azure_ai_search -Name 'indexes' -Default @()
+            }
+            if ($sdkIndexes.Count -gt 0) {
+                $indexConfig = $sdkIndexes[0]
+            }
+            elseif ($toolResources -and ($toolResources.PSObject.Properties.Name -contains 'azure_ai_search')) {
                 $indexes = Get-PropertyOrDefault -Object $toolResources.azure_ai_search -Name 'indexes' -Default @()
                 if ($indexes.Count -gt 0) { $indexConfig = $indexes[0] }
             }
@@ -155,28 +172,44 @@ foreach ($tool in $agentTools) {
             $notes.Add("azure_ai_search connection id was replaced with `${env:SEARCH_CONNECTION_ID} because connection ids are environment specific.")
         }
         'openapi' {
-            $spec = Get-PropertyOrDefault -Object $tool.openapi -Name 'spec'
+            $openApi = Get-PropertyOrDefault -Object $tool -Name 'openapi'
+            $spec = Get-PropertyOrDefault -Object $openApi -Name 'spec'
             $specFileName = "$id.openapi.json"
             $toolFiles[$specFileName] = $spec
-            $authType = [string](Get-PropertyOrDefault -Object $tool.openapi.auth -Name 'type' -Default 'anonymous')
-            $auth = [ordered]@{ type = $authType }
-            if ($authType -eq 'connection') { $auth['connectionId'] = '${env:OPENAPI_CONNECTION_ID}' }
+            $authType = [string](Get-PropertyOrDefault -Object $openApi.auth -Name 'type' -Default 'anonymous')
+            $auth = [ordered]@{ type = if ($authType -eq 'project_connection') { 'connection' } else { $authType } }
+            if ($authType -eq 'connection' -or $authType -eq 'project_connection') { $auth['connectionId'] = '${env:OPENAPI_CONNECTION_ID}' }
             if ($authType -eq 'managed_identity') { $auth['audience'] = '${env:OPENAPI_AUDIENCE}' }
             $definition['config'] = [ordered]@{
-                name     = [string](Get-PropertyOrDefault -Object $tool.openapi -Name 'name' -Default $id)
+                name     = [string](Get-PropertyOrDefault -Object $openApi -Name 'name' -Default $id)
                 specFile = $specFileName
                 auth     = $auth
             }
         }
         'function' {
+            $functionTool = Get-PropertyOrDefault -Object $tool -Name 'function' -Default $null
+            if ($null -eq $functionTool) { $functionTool = $tool }
             $definition['config'] = [ordered]@{
-                name       = [string](Get-PropertyOrDefault -Object $tool.function -Name 'name' -Default $id)
-                parameters = (Get-PropertyOrDefault -Object $tool.function -Name 'parameters' -Default ([ordered]@{ type = 'object'; properties = [ordered]@{} }))
+                name       = [string](Get-PropertyOrDefault -Object $functionTool -Name 'name' -Default $id)
+                parameters = (Get-PropertyOrDefault -Object $functionTool -Name 'parameters' -Default ([ordered]@{ type = 'object'; properties = [ordered]@{} }))
             }
             $notes.Add("function tool '$id' requires a client-side handler. Document the handler location in the agent README.")
         }
         'bing_grounding' {
             $definition['config'] = [ordered]@{ connectionId = '${env:BING_CONNECTION_ID}' }
+            $searchConfiguration = $null
+            if ($tool.PSObject.Properties.Name -contains 'bing_grounding' -and $tool.bing_grounding) {
+                $configurations = Get-PropertyOrDefault -Object $tool.bing_grounding -Name 'search_configurations' -Default @()
+                if ($configurations.Count -gt 0) { $searchConfiguration = $configurations[0] }
+            }
+            if ($searchConfiguration) {
+                $defaultCount = Get-PropertyOrDefault -Object $searchConfiguration -Name 'count' -Default $null
+                $defaultMarket = Get-PropertyOrDefault -Object $searchConfiguration -Name 'market' -Default $null
+                $defaultSetLang = Get-PropertyOrDefault -Object $searchConfiguration -Name 'set_lang' -Default $null
+                if ($null -ne $defaultCount) { $definition['config']['count'] = [int]$defaultCount }
+                if ($defaultMarket) { $definition['config']['market'] = [string]$defaultMarket }
+                if ($defaultSetLang) { $definition['config']['setLang'] = [string]$defaultSetLang }
+            }
         }
         'mcp' {
             $definition['config'] = [ordered]@{

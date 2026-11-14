@@ -44,6 +44,9 @@ parameters:
   - name: changeRecordId
     displayName: Approved change record id (for example CHG-0043912)
     type: string
+  - name: businessSignoffId
+    displayName: UAT business acceptance reference (for example BSO-0043912)
+    type: string
   - name: confirmProduction
     displayName: Type the agent name again to confirm
     type: string
@@ -79,7 +82,10 @@ stages:
                 if ('${{ parameters.changeRecordId }}' -notmatch '^[A-Za-z]{2,5}-[0-9]{4,10}$') {
                   throw "changeRecordId '${{ parameters.changeRecordId }}' does not look like a change record (expected for example CHG-0043912)."
                 }
-                Write-Host "Inputs confirmed for ${{ parameters.agentName }} under change ${{ parameters.changeRecordId }}."
+                if ('${{ parameters.businessSignoffId }}' -notmatch '^BSO-[0-9]{4,10}$') {
+                  throw "businessSignoffId '${{ parameters.businessSignoffId }}' is invalid (expected for example BSO-0043912)."
+                }
+                Write-Host "Inputs confirmed for ${{ parameters.agentName }} under change ${{ parameters.changeRecordId }} and business sign-off ${{ parameters.businessSignoffId }}."
 
           - download: testPipeline
             artifact: agentPackage
@@ -124,3 +130,4 @@ stages:
       validateSecretReferences: true
       rollbackOnFailure: true
       changeRecordId: ${{ parameters.changeRecordId }}
+      businessSignoffId: ${{ parameters.businessSignoffId }}

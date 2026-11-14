@@ -34,7 +34,26 @@ on:
         required: false
         default: ''
       reason:
-        description: Why this rollback is happening. Recorded in the release record.
+        description: Why this rollback is happening. Recorded in release governance evidence.
+        type: string
+        required: true
+      changeRecordId:
+        description: Approved rollback change reference. Required for PROD (for example CHG-0043912).
+        type: string
+        required: false
+        default: ''
+      businessSignoffId:
+        description: Business acceptance reference. Required for PROD (for example BSO-0043912).
+        type: string
+        required: false
+        default: ''
+      evaluationSuitePath:
+        description: Evaluation suite path when the target overlay requires evaluation.
+        type: string
+        required: false
+        default: ''
+      releaseRecordPath:
+        description: Exact failed/current release JSON path inside the downloaded artifact.
         type: string
         required: true
 
@@ -44,7 +63,7 @@ permissions:
   id-token: write
 
 concurrency:
-  group: rollback-${{ inputs.environment }}-${{ inputs.agentName }}
+  group: foundry-${{ inputs.environment }}-${{ inputs.agentName }}
   cancel-in-progress: false
 
 jobs:
@@ -63,6 +82,23 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
+      - name: Validate rollback governance inputs
+        shell: pwsh
+        run: |
+          Set-StrictMode -Version 3.0
+          $ErrorActionPreference = 'Stop'
+          if ([string]::IsNullOrWhiteSpace('${{ inputs.reason }}')) {
+            throw 'A non-empty rollback reason is required and is persisted in the release record.'
+          }
+          if ('${{ inputs.environment }}' -eq 'prod') {
+            if ('${{ inputs.changeRecordId }}' -notmatch '^[A-Za-z]{2,5}-[0-9]{4,10}$') {
+              throw 'PROD rollback requires an approved changeRecordId such as CHG-0043912.'
+            }
+            if ('${{ inputs.businessSignoffId }}' -notmatch '^BSO-[0-9]{4,10}$') {
+              throw 'PROD rollback requires a durable businessSignoffId such as BSO-0043912.'
+            }
+          }
+
       - name: Download candidate packages
         uses: actions/download-artifact@v4
         with:
@@ -78,7 +114,20 @@ jobs:
           tenant-id: ${{ vars.AZURE_TENANT_ID }}
           subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
 
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install pinned Foundry SDK dependencies
+        shell: pwsh
+        run: |
+          Set-StrictMode -Version 3.0
+          $ErrorActionPreference = 'Stop'
+          python -m pip install --disable-pip-version-check -r scripts/python/requirements.txt
+
       - name: Roll back
+        id: rollback
         shell: pwsh
         run: |
           Set-StrictMode -Version 3.0
@@ -89,20 +138,21 @@ jobs:
             ArtifactDirectory = './artifacts'
             ReleaseDirectory  = './out/releases'
             Reason            = '${{ inputs.reason }}'
+            ChangeRecordId    = '${{ inputs.changeRecordId }}'
+            BusinessSignoffId = '${{ inputs.businessSignoffId }}'
+            ReleaseRecordPath = './artifacts/${{ inputs.releaseRecordPath }}'
+            EvaluationSuitePath = '${{ inputs.evaluationSuitePath }}'
             Confirm           = $false
           }
           if ('${{ inputs.toPackageId }}' -ne '') { $parameters['ToPackageId'] = '${{ inputs.toPackageId }}' }
-          ./scripts/Invoke-Rollback.ps1 @parameters
-
-      - name: Smoke test the rolled-back agent
-        shell: pwsh
-        run: |
-          Set-StrictMode -Version 3.0
-          $ErrorActionPreference = 'Stop'
-          ./tests/smoke/Invoke-SmokeTest.ps1 `
-            -Environment '${{ inputs.environment }}' `
-            -AgentName '${{ inputs.agentName }}' `
-            -ResultPath './out/smoke-rollback.json'
+          $commandOutput = @(./scripts/Invoke-Rollback.ps1 @parameters)
+          $commandOutput | Write-Output
+          $result = @($commandOutput | Where-Object {
+            $_.PSObject.Properties.Name -contains 'ReleaseRecord'
+          }) | Select-Object -Last 1
+          if (-not $result) { throw 'Rollback completed without returning the deployment result contract.' }
+          "releaseRecordPath=$($result.ReleaseRecord)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "packagePath=$($result.PackagePath)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
 
       - name: Upload rollback record
         if: always()

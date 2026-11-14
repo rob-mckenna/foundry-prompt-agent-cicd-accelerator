@@ -48,6 +48,8 @@ param(
 
     [string]$ResultPath,
 
+    [string]$ReleaseRecordPath,
+
     [ValidateRange(0.0, 1.0)]
     [double]$SimilarityFloor = 0.6,
 
@@ -60,7 +62,7 @@ Set-StrictMode -Version 3.0
 $ErrorActionPreference = 'Stop'
 
 $moduleRoot = Join-Path (Split-Path -Parent (Split-Path -Parent $PSScriptRoot)) 'scripts/modules/FoundryAgentOps/FoundryAgentOps.psd1'
-Import-Module $moduleRoot -Force
+Import-Module $moduleRoot
 
 $repoRoot = Get-RepositoryRoot
 if (-not $CasePath) { $CasePath = Join-Path $PSScriptRoot 'cases' }
@@ -95,22 +97,20 @@ function Get-JaccardSimilarity {
 }
 
 $config = Get-EnvironmentConfig -Environment $Environment -ConfigRoot $ConfigRoot
-$tenantId = if ($config['azure'].Contains('tenantId')) { [string]$config['azure']['tenantId'] } else { $null }
+$startedUtc = [DateTime]::UtcNow.ToString('o')
+$target = $null
 $results = [System.Collections.Generic.List[pscustomobject]]::new()
-$accessToken = $null
 
 try {
-    $accessToken = Get-FoundryAccessToken -Scope $config['foundry']['tokenScope'] -TenantId $tenantId
-
-    if (-not $AgentId) {
-        $record = Get-LatestReleaseRecord -EnvironmentConfig $config -AgentName $AgentName -LocalFallbackDirectory (Join-Path $repoRoot 'out/releases')
-        if ($record -and $record['agent'].Contains('remoteAgentId')) { $AgentId = [string]$record['agent']['remoteAgentId'] }
+    if ($AgentId) { throw 'Assistant-ID invocation is unsupported. Use logical agent name and an exact release record.' }
+    if ($ReleaseRecordPath) {
+        $target = Get-FoundryReleaseTarget -ReleaseRecordPath $ReleaseRecordPath -EnvironmentConfig $config
+        if ($target.Record['agent']['name'] -cne $AgentName) { throw 'Regression target identity mismatch.' }
+        $agent = $target.Agent
     }
-    if (-not $AgentId) {
-        $agent = Get-FoundryAgent -EnvironmentConfig $config -LogicalName $AgentName -AccessToken $accessToken
-        if (-not $agent) { throw "Agent '$AgentName' was not found in '$Environment'." }
-        $AgentId = $agent.id
-    }
+    else { $agent = Get-FoundryAgent -EnvironmentConfig $config -LogicalName $AgentName }
+    if (-not $agent) { throw "Agent '$AgentName' was not found in '$Environment'." }
+    $AgentId = $agent.id
 
     Write-OpsLog -Level Step -Message "Regression testing $AgentId in '$Environment' across $($caseFiles.Count) case file(s)"
 
@@ -125,8 +125,8 @@ try {
         foreach ($case in $document['cases']) {
             $id = [string]$case['id']
             $timeout = if ($case.Contains('timeoutSeconds')) { [int]$case['timeoutSeconds'] } else { 120 }
-            $response = Invoke-FoundryAgentRun -EnvironmentConfig $config -AgentId $AgentId -Prompt $case['prompt'] `
-                -AccessToken $accessToken -TimeoutSeconds $timeout
+            $response = Invoke-FoundryAgentRun -EnvironmentConfig $config -LogicalName $AgentName -AgentVersion $agent.activeVersion `
+                -Prompt $case['prompt'] -TimeoutSeconds $timeout
 
             $problems = @()
             $warnings = @()
@@ -182,6 +182,10 @@ try {
                     LatencyMs  = $response.LatencyMs
                     Problems   = $problems
                     Warnings   = $warnings
+                    Live = $true
+                    Status = $response.Status
+                    ResponseId = $response.ResponseId
+                    ConversationId = $response.ConversationId
                 })
 
             $marker = if ($problems.Count -eq 0) { 'pass' } else { 'FAIL' }
@@ -195,9 +199,7 @@ try {
         }
     }
 }
-finally {
-    if ($accessToken) { $accessToken.Dispose() }
-}
+finally {}
 
 $passed = @($results | Where-Object Passed).Count
 $failed = $results.Count - $passed
@@ -206,12 +208,20 @@ $drifted = @($results | Where-Object { $_.Warnings.Count -gt 0 }).Count
 $summary = [ordered]@{
     agentName   = $AgentName
     environment = $Environment
-    executedUtc = [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')
+    executedUtc = [DateTime]::UtcNow.ToString('o')
     total       = $results.Count
     passed      = $passed
     failed      = $failed
     drifted     = $drifted
     cases       = @($results)
+    schemaVersion = '1.1.0'
+    gate = 'regression'
+    mode = if ($UpdateBaseline) { 'baseline-update' } else { 'unbound' }
+    startedUtc = $startedUtc
+    liveExecuted = $results.Count
+}
+if ($target -and -not $UpdateBaseline) {
+    foreach ($key in $target.Identity.Keys) { $summary[$key] = $target.Identity[$key] }
 }
 if ($ResultPath) { Write-JsonFile -InputObject $summary -Path $ResultPath -Depth 10 -Confirm:$false | Out-Null }
 

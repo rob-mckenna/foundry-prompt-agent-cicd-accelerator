@@ -23,13 +23,22 @@ and its policy assignments stay under landing zone control.
 | Project managed identity | Search Index Data Reader | resource group | The project reads the knowledge index |
 | Project managed identity | Storage Queue Data Contributor | resource group | `azure_function` tools exchange messages over queues |
 | Project managed identity | Key Vault Secrets User | resource group | Connections that resolve secrets at run time |
-| CI/CD identity | Azure AI User | resource group | Create and update agents on the data plane |
+| CI/CD identity | Foundry User | resource group | Create and update agents on the data plane |
 | CI/CD identity | Key Vault Secrets User | resource group | Resolve `secretRefs` during deployment |
 | CI/CD identity | Storage Blob Data Contributor | resource group | Write release records |
-| Operator group | Azure AI User | resource group | Humans inspect and test agents in the portal |
+| Operator group | Foundry User | resource group | Humans inspect and test agents in the portal; also permits authoring |
 
 Assignments are made at resource group scope with deterministic `guid()` names, so redeployment is idempotent.
 Tighten to individual resource scopes if your standard requires it.
+
+Foundry User (formerly Azure AI User) uses the unchanged built-in role GUID
+`53ca6127-db72-4b80-b1b0-d745d6d5456d` in this template. The operator grant is not read-only; it includes
+authoring permissions. It grants neither agent application publishing nor permission to manage role
+assignments. See [Foundry authorization and scope](../../docs/architecture.md#identity-and-trust).
+
+The template consumes existing principal IDs; it does not create or migrate federated credentials.
+Establish the exact repository/environment-bound trust externally using the repository's current
+[OIDC subject format](../../docs/deployment-runbook.md#github-oidc-subject-formats).
 
 ## Deploy
 

@@ -9,7 +9,7 @@ flowchart TB
     subgraph DEVLOOP["Developer loop"]
         A1["Edit agent.manifest.json,<br/>instructions.md, overlays"]
         A2["./scripts/Invoke-Validation.ps1<br/>offline, no Azure"]
-        A3["import-agent.ps1 -WhatIf<br/>see the exact payload"]
+        A3["import-agent.ps1 -WhatIf<br/>structural summary + digest"]
         A1 --> A2 --> A3 --> A4["Push branch"]
     end
 
@@ -41,16 +41,17 @@ flowchart TB
     D2 --> D4
 
     subgraph OIDC["Authentication"]
-        O1["Request OIDC token<br/>subject repo:owner/repo:environment:dev"]
+        O1["Request OIDC token<br/>configured repository and dev environment subject"]
         O2["Entra ID validates the federated credential"]
-        O3["Access token, Azure AI User"]
+        O3["Access token; Foundry User authorization"]
     end
 
     D4 --> O1 --> O2 --> O3
-    O3 --> DEPLOY1["Verify package<br/>Resolve overlay<br/>Governance gate<br/>Preflight<br/>POST /assistants"]
+    O3 --> DEPLOY1["Verify descriptor-bound package<br/>resolve overlay + governance + preflight<br/>stage prior package + attested JSON<br/>persist started BEFORE create + verify pin"]
     DEPLOY1 --> FDEV["Foundry DEV project"]
-    DEPLOY1 --> SMOKE1["Smoke test"]
-    SMOKE1 --> REC1["Release record<br/>blob + artifact"]
+    DEPLOY1 --> GATES1["Release-bound live gates<br/>SDK Conversations/Responses"]
+    GATES1 --> ATTEST1["Complete-Release.ps1<br/>attests release"]
+    ATTEST1 --> REC1["Release record<br/>succeeded or failed"]
 
     D3 --> TESTWF["deploy-test.yml (manual)<br/>input: sourceRunId"]
     subgraph PROMO["Promotion, no rebuild"]
@@ -68,22 +69,49 @@ flowchart TB
         P1["Preflight: verify artifact,<br/>agent name, change record format"]
         P2["GitHub Environment 'prod'<br/>reviewers + wait timer + branch policy"]
         P3["Promote identical package"]
-        P4["Smoke + regression"]
+        P4["Required live gates + Complete-Release<br/>exact release/service identity"]
         P5{"Passed?"}
         P6["Release record"]
-        P7["Automatic rollback<br/>to previous packageId"]
+        P7["One Invoke-Rollback attempt<br/>prior package + attested JSON<br/>new service version + required gates"]
     end
     PRODWF --> P1 --> P2 --> P3 --> P4 --> P5
     P5 -->|yes| P6
     P5 -->|no| P7
 ```
 
+Inside `_reusable-deploy.yml`, GitHub Actions installs Python 3.11 and `scripts/python/requirements.txt`
+before invoking `import-agent.ps1` or `promote-agent.ps1`. The same workflow now runs
+`scripts/Complete-Release.ps1` after the smoke/evaluation/regression steps, so the release is only final once
+the record has moved beyond `pending-verification`. Each runner receives the exact deployment result's
+`-ReleaseRecordPath`; evidence binds the attempt, package, manifest semver, opaque service version, environment,
+endpoint and post-activation times. Required smoke needs a live canary, not configuration-only checks.
+Missing, empty, skipped, offline, unbound or failed required evidence marks
+the record failed and fails the job.
+
+Each promotion handoff carries both the immutable package and the source environment's attested release record.
+`promote-agent.ps1` schema-validates that transported record, avoiding cross-environment release-store access.
+
+Failure invokes a separate `Invoke-Rollback.ps1` step using the exact failed/current release context and prior
+package **plus attested release JSON** staged by import whenever durable
+evidence says runtime mutation started and the prior artifact exists. This also covers an import/promote command
+that exits nonzero after potentially mutating creation; a pre-mutation failure does not roll back.
+Recovery creates a new service version and runs the target package's required live gates and attestation.
+Pending verification is not recovery success, and the original deployment job still fails after recovery.
+`Complete-Release.ps1` is not also called with `-RollbackOnFailure` in this workflow.
+
+Deployment/testing and the manual rollback workflow share the `foundry-<environment>-<agentName>` concurrency
+identity. Out-of-band concurrent routing edits are unsupported; before/after route checks are not proof
+that no transient external edit occurred. First deployment without a known-good prior artifact requires
+manual recovery and may be exposed before gates. These paths remain Azure-unverified.
+
 ## Why the artifact is passed by run id
 
 `deploy-test.yml` takes a `sourceRunId` and downloads that run's artifact with
 `actions/download-artifact@v4` using `run-id`. This is what makes promotion verifiable: the job cannot
 accidentally rebuild from a newer `main`, because it never reads agent source at all. The first thing it does
-is recompute the content address and compare it with the descriptor.
+is verify the descriptor-bound `/2` content address (or strict legacy `/1`) and compare it with the release.
+Reproducible IDs do not guarantee identical ZIP bytes; promotions transport the original archive unchanged.
+Per-environment resolution and external state still change runtime behaviour.
 
 ## GitHub configuration required
 
@@ -94,7 +122,7 @@ is recompute the content address and compare it with the descriptor.
 | Protection on `test` | Required reviewers, deployment branch policy limited to `main` |
 | Protection on `uat` | Required reviewers including the business owner |
 | Protection on `prod` | Required reviewers, wait timer, branch and tag policy for `main` and `v*.*.*` |
-| Federated credentials | One per environment: `repo:OWNER/REPO:environment:dev` and so on |
+| Federated credentials | Environment-bound credentials matching the repository's configured [OIDC subject format](../deployment-runbook.md#github-oidc-subject-formats) |
 | Ruleset on `main` | Require pull request, require the `validate` check, require code owner review, block force push |
 | Workflow permissions | Read repository contents by default; `id-token: write` only where OIDC is needed |
 

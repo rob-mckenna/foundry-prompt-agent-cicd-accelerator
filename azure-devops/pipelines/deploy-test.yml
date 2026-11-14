@@ -80,6 +80,7 @@ stages:
       runRegression: true
       validateSecretReferences: false
       rollbackOnFailure: true
+      republishPackage: true
 
   - ${{ if eq(parameters.promoteToUat, true) }}:
       - template: templates/stages/deploy-stage.yml
@@ -96,7 +97,6 @@ stages:
           operation: promote
           sourceEnvironment: test
           packageArtifactName: agentPackage
-          sourcePipelineResource: devPipeline
           runEvaluations: ${{ ne(parameters.evaluationSuitePath, '') }}
           evaluationSuitePath: ${{ parameters.evaluationSuitePath }}
           runRegression: true

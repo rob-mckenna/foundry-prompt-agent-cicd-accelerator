@@ -41,6 +41,24 @@ One file per agent. Each case asserts behaviour that must not change without an 
 | `mustMatch` | The response must match the regular expression. Failure. |
 | `baseline.response` | Compared by token-set similarity. Below the floor it warns; with `-TreatDriftAsFailure` it fails. |
 
+## Release-bound execution
+
+```powershell
+.\tests\regression\Invoke-RegressionTest.ps1 -Environment test -AgentName kb-research-agent `
+  -ReleaseRecordPath $deploy.ReleaseRecord -ResultPath .\out\regression-test.json
+```
+
+Use the exact import/promotion result's `ReleaseRecord`, not `latest.json`. Without it, live runs remain
+standalone diagnostics and cannot attest a release. Invocation uses the shared SDK Conversations/Responses
+helper and logical agent name; assistant-ID-only targets are unsupported. The enabled endpoint must pin
+one concrete service version at 100%, verified before/after invocation, separate from manifest semver.
+Only completed Responses with usable text and no unresolved client tool/approval requirement can pass.
+Conversations are cleaned up in `finally`.
+
+Attestable `1.1.0` results bind release/package/agent/environment/endpoint, manifest/service versions and
+execution after verified activation. All cases execute live and retain completed Response IDs, with totals
+consistent with details. Offline SDK tests do not establish authenticated Azure inference qualification.
+
 ## Baselines
 
 Baselines are captured deliberately:
@@ -53,6 +71,7 @@ git diff ./tests/regression/cases/
 
 Commit the baseline change together with the change that caused it, so the diff explains itself. Baselines are
 never refreshed automatically; drift you did not intend is the whole point of the layer.
+`-UpdateBaseline` results are explicitly non-attestable, even if a release path is supplied.
 
 Capture baselines in TEST, not DEV. DEV uses a smaller model and looser settings, so a DEV baseline produces
 false drift everywhere else.

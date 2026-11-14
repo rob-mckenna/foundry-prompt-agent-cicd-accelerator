@@ -1,7 +1,8 @@
 # Terraform infrastructure
 
-Equivalent to `infra/bicep`, for teams whose platform standard is Terraform. Pick one. Running both against
-the same resource group will cause the two state models to fight.
+An alternative to `infra/bicep` for teams whose platform standard is Terraform, with different role
+assignment scopes noted below. Pick one. Running both against the same resource group will cause the two
+state models to fight.
 
 ## Providers
 
@@ -37,10 +38,28 @@ env:
   TF_VAR_subscription_id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
 ```
 
+These templates do not create or migrate GitHub federated credentials. Establish the exact
+repository/environment-bound trust externally using the repository's current immutable, legacy or
+customized [OIDC subject format](../../docs/deployment-runbook.md#github-oidc-subject-formats).
+Setting `ARM_USE_OIDC` and client/tenant/subscription identifiers does not create that trust or grant
+resource permissions.
+
 In Azure DevOps, run Terraform inside an `AzureCLI@2` task backed by a workload identity federation service
 connection and set `ARM_USE_AZURECLI_AUTH=true`.
 
 The state backend uses `use_azuread_auth = true`, so no storage account key is needed or accepted.
+
+## Role assignments
+
+The deployment and operator Foundry role assignments use the stable built-in role GUID
+`53ca6127-db72-4b80-b1b0-d745d6d5456d` for **Foundry User** (formerly Azure AI User), avoiding display-name
+lookup during the rename rollout. Both assignments remain at Foundry account scope with the same
+permissions; the Bicep template grants this role at resource-group scope. There is no tfvars role-name or
+role-ID override.
+
+Foundry User includes authoring permissions, not just reading/testing. It grants neither agent application
+publishing nor permission to manage role assignments. See
+[Foundry authorization and scope](../../docs/architecture.md#identity-and-trust).
 
 ## Deploy
 

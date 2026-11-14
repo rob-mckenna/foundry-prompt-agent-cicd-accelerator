@@ -38,6 +38,7 @@ on:
 permissions:
   contents: read
   actions: read
+  id-token: write
 
 concurrency:
   group: deploy-test-${{ inputs.agentName }}
@@ -64,15 +65,25 @@ jobs:
           run-id: ${{ inputs.sourceRunId }}
           github-token: ${{ github.token }}
 
+      - name: Download the attested DEV release record
+        uses: actions/download-artifact@v4
+        with:
+          name: release-dev-${{ inputs.sourceRunId }}
+          path: artifacts/source-release
+          run-id: ${{ inputs.sourceRunId }}
+          github-token: ${{ github.token }}
+
       - name: Verify and identify the package
         id: inspect
         shell: pwsh
         run: |
           Set-StrictMode -Version 3.0
           $ErrorActionPreference = 'Stop'
-          $package = Get-ChildItem ./artifacts -Filter '*.zip' -Recurse | Select-Object -First 1
+          $packages = @(Get-ChildItem ./artifacts -Filter '*.zip' -File)
+          if ($packages.Count -ne 1) { throw 'Expected exactly one unchanged package at the artifact root.' }
+          $package = $packages[0]
           if (-not $package) { throw "Run ${{ inputs.sourceRunId }} produced no package artifact." }
-          $result = ./scripts/Test-AgentPackage.ps1 -PackagePath $package.FullName
+          $result = ./scripts/Test-AgentPackage.ps1 -PackagePath $package.FullName -Environment dev
           if ($result.AgentName -ne '${{ inputs.agentName }}') {
             throw "Artifact holds agent '$($result.AgentName)' but '${{ inputs.agentName }}' was requested."
           }
@@ -84,7 +95,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: promoted-package
-          path: artifacts/*.zip
+          path: artifacts/
           if-no-files-found: error
           retention-days: 365
 
@@ -106,9 +117,35 @@ jobs:
       runRegression: true
       validateSecretReferences: false
 
+  prepare-uat:
+    name: Prepare TEST-attested handoff
+    needs: [resolve-package, deploy-test]
+    if: inputs.promoteToUat
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download unchanged promoted package
+        uses: actions/download-artifact@v4
+        with:
+          name: promoted-package
+          path: artifacts
+
+      - name: Download the attested TEST release record
+        uses: actions/download-artifact@v4
+        with:
+          name: release-test-${{ github.run_id }}
+          path: artifacts/source-release
+
+      - name: Publish UAT handoff
+        uses: actions/upload-artifact@v4
+        with:
+          name: uat-package
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 365
+
   deploy-uat:
     name: Promote to UAT
-    needs: [resolve-package, deploy-test]
+    needs: [resolve-package, prepare-uat]
     if: inputs.promoteToUat
     uses: ./.github/workflows/_reusable-deploy.yml
     with:
@@ -116,7 +153,7 @@ jobs:
       targetEnvironment: uat
       agentName: ${{ inputs.agentName }}
       agentVersion: ${{ needs.resolve-package.outputs.agentVersion }}
-      artifactName: promoted-package
+      artifactName: uat-package
       packageFile: ${{ needs.resolve-package.outputs.packageFile }}
       operation: promote
       sourceEnvironment: test

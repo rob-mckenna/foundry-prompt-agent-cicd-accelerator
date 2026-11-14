@@ -15,9 +15,9 @@ flowchart TB
     end
 
     subgraph RUNTIME["Deployed agent in a Foundry project"]
-        AGENT["Assistant resource<br/>model + instructions + tools + tool_resources + metadata"]
-        THREAD["Thread"]
-        RUN["Run"]
+        AGENT["Prompt agent resource<br/>active pinned service version"]
+        THREAD["SDK Conversation"]
+        RUN["SDK Response"]
     end
 
     MAN --> AGENT
@@ -27,12 +27,17 @@ flowchart TB
     AGENT --> THREAD --> RUN
 ```
 
+Owner and classification remain part of the source package and governance evaluation. The bridge maps the
+definition to `PromptAgentDefinition` and passes description/custom metadata separately to `create_version`.
+Code-interpreter file ids remain unmapped and are omitted with a warning.
+Manifest semver is not the opaque service version: live checks read the active version, not latest.
+
 ## Knowledge and tools at run time
 
 ```mermaid
 flowchart TB
-    USER["Calling application"] -->|user message| THREAD["Thread"]
-    THREAD --> RUN["Run"]
+    USER["Calling application"] -->|input| THREAD["SDK Conversation"]
+    THREAD --> RUN["SDK Response<br/>agent-bound endpoint"]
     RUN --> MODEL["Model deployment<br/>gpt-4o / gpt-4o-mini"]
     MODEL -->|decides to call a tool| DISPATCH{"Tool"}
 
@@ -74,6 +79,19 @@ flowchart TB
     MODEL -->|final message| USER
 ```
 
+The repository's smoke, evaluation and regression runners share `Invoke-FoundryAgentRun`:
+`get_openai_client(agent_name=...)`, `conversations.create()` and `responses.create(...)`, polling only
+nonterminal Responses and cleaning up the conversation in `finally`. The Projects client explicitly sets
+the documented `allow_preview=True` opt-in. The live contract requires an enabled Responses endpoint with
+one concrete fixed version at 100%, verified before/after invocation; no version override or classic
+threads/runs fallback is assumed. Completed usable text is required; unresolved client-side function/tool
+or approval requests fail rather than receiving fabricated results. The diagram describes possible tools,
+not a client-side executor implemented by these gate runners.
+
+Offline SDK serialization/request-capture evidence is not Azure inference or tool qualification.
+Same-archive promotion preserves source, not identical environment behaviour: overlays and external knowledge,
+connections, model deployments and secrets still differ.
+
 ## Identity and data access
 
 The Foundry **project** has a system-assigned managed identity. That identity, not the deployment identity,
@@ -87,7 +105,7 @@ flowchart LR
     PROJ -->|Key Vault Secrets User| KV["Key Vault"]
 
     CICD["CI/CD workload identity"]
-    CICD -->|Azure AI User| PROJ
+    CICD -->|Foundry User| PROJ
     CICD -->|Key Vault Secrets User| KV
     CICD -->|Storage Blob Data Contributor| BLOB["Release record container"]
 ```
@@ -135,8 +153,9 @@ string.
 | `bing_grounding` | `tools[].bing_grounding.search_configurations[]` | connection id | DEV and TEST only, external egress |
 | `mcp` | `tools[].server_label` and `server_url` | server URL | DEV and TEST only, external egress |
 
-The mapping is implemented once, in `ConvertTo-FoundryAgentPayload`
-(`scripts/modules/FoundryAgentOps/FoundryAgentOps.psm1`). An unknown type raises an error rather than being
+The table describes the intermediate payload from `ConvertTo-FoundryAgentPayload`
+(`scripts/modules/FoundryAgentOps/FoundryAgentOps.psm1`); the Python bridge converts it to Projects SDK models.
+An unknown type raises an error rather than being
 skipped, so a typo cannot quietly remove a capability from a production agent.
 
 ## Disabling a tool for an environment

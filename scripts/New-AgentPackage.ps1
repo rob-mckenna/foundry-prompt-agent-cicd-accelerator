@@ -7,7 +7,7 @@
     The package is built once, on merge to main, and is then promoted unchanged through DEV, TEST, UAT and
     PROD. Environment differences live in overlays that ship inside the package, so promotion never rebuilds.
 
-    Package layout (foundry-agent-package/1):
+    Package layout (foundry-agent-package/2):
 
         package.json                 Descriptor: package id, agent identity, build provenance, inventory
         checksums.sha256             SHA-256 of every other file, including package.json
@@ -17,8 +17,8 @@
         environments/<env>.overlay.json
         evaluations/**               Evaluation suites and datasets
 
-    packageId is the SHA-256 of the checksum manifest computed over every file except package.json, so it is
-    stable, self-verifying and free of circular references.
+    packageId binds canonical stable descriptor fields and all source file checksums. Informational build
+    time, run, builder and ref are checksum-protected but excluded from the content address.
 
 .PARAMETER AgentPath
     Folder containing agent.manifest.json and an environments/ folder.
@@ -64,7 +64,7 @@ param(
 Set-StrictMode -Version 3.0
 $ErrorActionPreference = 'Stop'
 
-Import-Module (Join-Path $PSScriptRoot 'modules/FoundryAgentOps/FoundryAgentOps.psd1') -Force
+Import-Module (Join-Path $PSScriptRoot 'modules/FoundryAgentOps/FoundryAgentOps.psd1')
 
 function Get-GitValue {
     param([string[]]$Arguments, [string]$Fallback = 'unknown')
@@ -171,13 +171,11 @@ foreach ($targetEnv in $Environment) {
 }
 
 $contentManifest = New-ChecksumManifest -Root $stagingRoot -ExcludeRelativePath @('package.json')
-$packageId = Get-PackageId -ChecksumManifest $contentManifest
 
 $descriptor = [ordered]@{
     '$schema'     = 'https://github.com/foundry-prompt-agent-cicd-accelerator/schemas/package-descriptor.schema.json'
     schemaVersion = '1.0.0'
-    packageFormat = 'foundry-agent-package/1'
-    packageId     = $packageId
+    packageFormat = 'foundry-agent-package/2'
     agent         = [ordered]@{
         name    = $agentName
         version = $agentVersion
@@ -194,7 +192,7 @@ $descriptor = [ordered]@{
     contents      = [ordered]@{
         manifest     = 'manifest/agent.manifest.json'
         instructions = "manifest/$($manifest['instructions']['file'])"
-        environments = @($Environment)
+        environments = @($Environment | Sort-Object -Unique)
         tools        = @($copiedTools | Sort-Object)
         evaluations  = @($copiedEvaluations | Sort-Object)
     }
@@ -213,9 +211,9 @@ elseif ($env:SYSTEM_COLLECTIONURI -and $env:SYSTEM_TEAMPROJECT -and $env:BUILD_B
 else { $null }
 if ($buildRunUrl) { $descriptor['build']['buildRunUrl'] = $buildRunUrl }
 
-Write-JsonFile -InputObject $descriptor -Path (Join-Path $stagingRoot 'package.json') -Depth 16 -Confirm:$false -WhatIf:$false | Out-Null
-
-$descriptor['fileCount'] = (Get-ChildItem -LiteralPath $stagingRoot -Recurse -File).Count
+$descriptor['fileCount'] = @(Get-ChildItem -LiteralPath $stagingRoot -Recurse -File).Count + 1
+$packageId = Get-PackageId -ChecksumManifest $contentManifest -Descriptor $descriptor
+$descriptor['packageId'] = $packageId
 Write-JsonFile -InputObject $descriptor -Path (Join-Path $stagingRoot 'package.json') -Depth 16 -Confirm:$false -WhatIf:$false | Out-Null
 
 $fullManifest = New-ChecksumManifest -Root $stagingRoot

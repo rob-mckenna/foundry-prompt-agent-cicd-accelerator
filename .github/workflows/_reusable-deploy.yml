@@ -61,7 +61,11 @@ on:
         type: boolean
         default: false
       changeRecordId:
-        description: Change record id recorded in agent metadata for production deployments.
+        description: Approved change reference recorded in production metadata and release governance evidence.
+        type: string
+        default: ''
+      businessSignoffId:
+        description: Durable UAT business acceptance reference (BSO- followed by 4-10 digits) required for PROD.
         type: string
         default: ''
 
@@ -74,6 +78,9 @@ jobs:
     name: Deploy to ${{ inputs.targetEnvironment }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    concurrency:
+      group: foundry-${{ inputs.targetEnvironment }}-${{ inputs.agentName }}
+      cancel-in-progress: false
     environment:
       name: ${{ inputs.environment }}
     env:
@@ -99,7 +106,8 @@ jobs:
           $ErrorActionPreference = 'Stop'
           ./scripts/Test-AgentPackage.ps1 `
             -PackagePath "./artifacts/${{ inputs.packageFile }}" `
-            -Environment ${{ inputs.targetEnvironment }}
+            -Environment ${{ inputs.targetEnvironment }} -SkipGovernance
+          # Runtime governance, including the real change reference, is mandatory in import-agent before mutation.
 
       - name: Sign in to Azure with workload identity federation
         uses: azure/login@v2
@@ -108,35 +116,108 @@ jobs:
           tenant-id: ${{ vars.AZURE_TENANT_ID }}
           subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
 
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Foundry SDK dependencies
+        shell: pwsh
+        run: |
+          Set-StrictMode -Version 3.0
+          $ErrorActionPreference = 'Stop'
+          python -m pip install --disable-pip-version-check -r scripts/python/requirements.txt
+
       - name: Deploy package
+        id: deploy
         if: inputs.operation == 'deploy'
         shell: pwsh
         run: |
           Set-StrictMode -Version 3.0
           $ErrorActionPreference = 'Stop'
+          $evidencePath = './out/deployment-evidence.json'
+          $result = $null
           $parameters = @{
-            PackagePath      = "./artifacts/${{ inputs.packageFile }}"
-            Environment      = '${{ inputs.targetEnvironment }}'
-            Operation        = 'deploy'
-            ReleaseDirectory = './out/releases'
-            GateResult       = @{ validation = 'passed' }
+            PackagePath            = "./artifacts/${{ inputs.packageFile }}"
+            Environment            = '${{ inputs.targetEnvironment }}'
+            Operation              = 'deploy'
+            ReleaseDirectory       = './out/releases'
+            DeploymentEvidencePath = $evidencePath
+            GateResult             = @{ validation = 'passed' }
           }
+          if ('${{ inputs.changeRecordId }}') { $parameters['ChangeRecordId'] = '${{ inputs.changeRecordId }}' }
+          if ('${{ inputs.businessSignoffId }}') { $parameters['BusinessSignoffId'] = '${{ inputs.businessSignoffId }}' }
           if ('${{ inputs.validateSecretReferences }}' -eq 'true') { $parameters['ValidateSecretReferences'] = $true }
-          ./scripts/import-agent.ps1 @parameters
+          try {
+            $commandOutput = @(./scripts/import-agent.ps1 @parameters)
+            $commandOutput | Write-Output
+            $result = @($commandOutput | Where-Object {
+                $_.PSObject.Properties.Name -contains 'ReleaseRecord'
+              }) | Select-Object -Last 1
+            if (-not $result) {
+              throw 'Deployment completed without returning the deployment result contract.'
+            }
+          }
+          finally {
+            if (Test-Path -LiteralPath $evidencePath) {
+              $evidence = Get-Content -LiteralPath $evidencePath -Raw | ConvertFrom-Json
+              "releaseRecordPath=$($evidence.releaseRecordPath)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+              "rollbackArtifactPath=$($evidence.rollbackArtifactPath)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+              "mutationStarted=$(([string]$evidence.mutationStarted).ToLowerInvariant())" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+              "mutationCompleted=$(([string]$evidence.mutationCompleted).ToLowerInvariant())" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+              "priorArtifactStaged=$(([string]$evidence.priorArtifactStaged).ToLowerInvariant())" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+              "failureEvidencePath=$evidencePath" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+            }
+          }
 
       - name: Promote package
+        id: promote
         if: inputs.operation == 'promote'
         shell: pwsh
         run: |
           Set-StrictMode -Version 3.0
           $ErrorActionPreference = 'Stop'
-          ./scripts/promote-agent.ps1 `
-            -AgentName '${{ inputs.agentName }}' `
-            -FromEnvironment '${{ inputs.sourceEnvironment }}' `
-            -ToEnvironment '${{ inputs.targetEnvironment }}' `
-            -PackagePath "./artifacts/${{ inputs.packageFile }}" `
-            -ReleaseDirectory './out/releases' `
-            -GateResult @{ validation = 'passed' }
+          $evidencePath = './out/deployment-evidence.json'
+          $result = $null
+          $sourceEvidence = Get-Content './artifacts/source-release/deployment-evidence.json' -Raw | ConvertFrom-Json
+          if ($sourceEvidence.environment -ne '${{ inputs.sourceEnvironment }}' -or
+              $sourceEvidence.agentName -cne '${{ inputs.agentName }}' -or $sourceEvidence.mutationCompleted -ne $true) {
+            throw 'The handoff does not identify a completed source deployment.'
+          }
+          $sourceRecords = @(Get-ChildItem './artifacts/source-release' -Recurse -File -Filter "$($sourceEvidence.releaseId).json")
+          if ($sourceRecords.Count -ne 1) { throw 'The exact source attempt record is absent or ambiguous in the handoff.' }
+          $sourceReleaseRecordPath = $sourceRecords[0].FullName
+          try {
+            $commandOutput = @(./scripts/promote-agent.ps1 `
+              -AgentName '${{ inputs.agentName }}' `
+              -FromEnvironment '${{ inputs.sourceEnvironment }}' `
+              -ToEnvironment '${{ inputs.targetEnvironment }}' `
+              -PackagePath "./artifacts/${{ inputs.packageFile }}" `
+              -SourceReleaseRecordPath $sourceReleaseRecordPath `
+              -ReleaseDirectory './out/releases' `
+              -DeploymentEvidencePath $evidencePath `
+              -ChangeRecordId '${{ inputs.changeRecordId }}' `
+              -BusinessSignoffId '${{ inputs.businessSignoffId }}' `
+              -GateResult @{ validation = 'passed' })
+            $commandOutput | Write-Output
+            $result = @($commandOutput | Where-Object {
+                $_.PSObject.Properties.Name -contains 'ReleaseRecord'
+              }) | Select-Object -Last 1
+            if (-not $result) {
+              throw 'Promotion completed without returning the deployment result contract.'
+            }
+          }
+          finally {
+            if (Test-Path -LiteralPath $evidencePath) {
+              $evidence = Get-Content -LiteralPath $evidencePath -Raw | ConvertFrom-Json
+              "releaseRecordPath=$($evidence.releaseRecordPath)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+              "rollbackArtifactPath=$($evidence.rollbackArtifactPath)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+              "mutationStarted=$(([string]$evidence.mutationStarted).ToLowerInvariant())" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+              "mutationCompleted=$(([string]$evidence.mutationCompleted).ToLowerInvariant())" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+              "priorArtifactStaged=$(([string]$evidence.priorArtifactStaged).ToLowerInvariant())" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+              "failureEvidencePath=$evidencePath" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+            }
+          }
 
       - name: Smoke test
         shell: pwsh
@@ -147,6 +228,7 @@ jobs:
             -Environment '${{ inputs.targetEnvironment }}' `
             -AgentName '${{ inputs.agentName }}' `
             -ExpectedVersion '${{ inputs.agentVersion }}' `
+            -ReleaseRecordPath '${{ steps.deploy.outputs.releaseRecordPath || steps.promote.outputs.releaseRecordPath }}' `
             -ResultPath './out/smoke-${{ inputs.targetEnvironment }}.json'
 
       - name: Evaluations
@@ -157,6 +239,7 @@ jobs:
           $ErrorActionPreference = 'Stop'
           ./tests/evaluations/Invoke-EvaluationSuite.ps1 `
             -SuitePath '${{ inputs.evaluationSuitePath }}' `
+            -ReleaseRecordPath '${{ steps.deploy.outputs.releaseRecordPath || steps.promote.outputs.releaseRecordPath }}' `
             -Environment '${{ inputs.targetEnvironment }}' `
             -AgentName '${{ inputs.agentName }}' `
             -ResultPath './out/evaluation-${{ inputs.targetEnvironment }}.json'
@@ -168,9 +251,88 @@ jobs:
           Set-StrictMode -Version 3.0
           $ErrorActionPreference = 'Stop'
           ./tests/regression/Invoke-RegressionTest.ps1 `
+            -ReleaseRecordPath '${{ steps.deploy.outputs.releaseRecordPath || steps.promote.outputs.releaseRecordPath }}' `
             -Environment '${{ inputs.targetEnvironment }}' `
             -AgentName '${{ inputs.agentName }}' `
             -ResultPath './out/regression-${{ inputs.targetEnvironment }}.json'
+
+      - name: Attest release gates
+        if: always() && (steps.deploy.outcome == 'success' || steps.promote.outcome == 'success')
+        shell: pwsh
+        run: |
+          Set-StrictMode -Version 3.0
+          $ErrorActionPreference = 'Stop'
+          $releaseRecordPath = if ('${{ steps.deploy.outputs.releaseRecordPath }}') {
+            '${{ steps.deploy.outputs.releaseRecordPath }}'
+          }
+          else {
+            '${{ steps.promote.outputs.releaseRecordPath }}'
+          }
+          if ([string]::IsNullOrWhiteSpace($releaseRecordPath)) {
+            throw 'Deployment or promotion completed, but no release record path was captured for Complete-Release.ps1.'
+          }
+
+          $parameters = @{
+            ReleaseRecordPath = $releaseRecordPath
+            PackagePath       = "./artifacts/${{ inputs.packageFile }}"
+            SmokeResultPath   = './out/smoke-${{ inputs.targetEnvironment }}.json'
+            ReleaseDirectory  = './out/releases'
+          }
+          if ('${{ inputs.runEvaluations }}' -eq 'true' -and '${{ inputs.evaluationSuitePath }}' -ne '') {
+            $parameters['EvaluationResultPath'] = './out/evaluation-${{ inputs.targetEnvironment }}.json'
+          }
+          if ('${{ inputs.runRegression }}' -eq 'true') {
+            $parameters['RegressionResultPath'] = './out/regression-${{ inputs.targetEnvironment }}.json'
+          }
+
+          ./scripts/Complete-Release.ps1 @parameters
+
+      - name: Roll back on failure
+        if: >-
+          failure() &&
+          ((steps.deploy.outputs.mutationStarted == 'true' && steps.deploy.outputs.priorArtifactStaged == 'true') ||
+           (steps.promote.outputs.mutationStarted == 'true' && steps.promote.outputs.priorArtifactStaged == 'true'))
+        shell: pwsh
+        run: |
+          Set-StrictMode -Version 3.0
+          $ErrorActionPreference = 'Continue'
+          Write-Host "::warning::Deployment or post-deployment testing failed in '${{ inputs.targetEnvironment }}'. Attempting rollback to the previously promoted package."
+          try {
+            $rollbackArtifactPath = if ('${{ steps.deploy.outputs.rollbackArtifactPath }}') {
+              '${{ steps.deploy.outputs.rollbackArtifactPath }}'
+            }
+            else {
+              '${{ steps.promote.outputs.rollbackArtifactPath }}'
+            }
+            if ([string]::IsNullOrWhiteSpace($rollbackArtifactPath)) {
+              throw 'Deployment changed the environment, but no staged prior package was returned for automatic rollback.'
+            }
+            ./scripts/Invoke-Rollback.ps1 `
+              -ReleaseRecordPath '${{ steps.deploy.outputs.releaseRecordPath || steps.promote.outputs.releaseRecordPath }}' `
+              -EvaluationSuitePath '${{ inputs.evaluationSuitePath }}' `
+              -AgentName '${{ inputs.agentName }}' `
+              -Environment '${{ inputs.targetEnvironment }}' `
+              -ArtifactDirectory (Split-Path -Parent $rollbackArtifactPath) `
+              -ReleaseDirectory './out/releases' `
+              -ChangeRecordId '${{ inputs.changeRecordId }}' `
+              -BusinessSignoffId '${{ inputs.businessSignoffId }}' `
+              -Reason 'Automatic rollback: run ${{ github.run_id }} failed.' `
+              -Confirm:$false
+          }
+          catch {
+            Write-Host "::error::Automatic rollback failed: $($_.Exception.Message)"
+            Write-Host "::error::Follow the manual procedure in docs/deployment-runbook.md."
+            exit 1
+          }
+
+      - name: Surface first-deployment recovery
+        if: >-
+          failure() &&
+          ((steps.deploy.outputs.mutationStarted == 'true' && steps.deploy.outputs.priorArtifactStaged != 'true') ||
+           (steps.promote.outputs.mutationStarted == 'true' && steps.promote.outputs.priorArtifactStaged != 'true'))
+        shell: pwsh
+        run: |
+          Write-Host "::error::Runtime activation may have changed '${{ inputs.targetEnvironment }}', but no prior package exists. The failed release evidence is in the uploaded out/ artifact. Deploy a known-good package explicitly with import-agent.ps1 and run all required gates; do not attest the failed release."
 
       - name: Upload release record and test results
         if: always()
@@ -180,25 +342,3 @@ jobs:
           path: out/
           if-no-files-found: ignore
           retention-days: 365
-
-      - name: Roll back on failure
-        if: failure() && inputs.targetEnvironment != 'dev'
-        shell: pwsh
-        run: |
-          Set-StrictMode -Version 3.0
-          $ErrorActionPreference = 'Continue'
-          Write-Host "::warning::Deployment or post-deployment testing failed in '${{ inputs.targetEnvironment }}'. Attempting rollback to the previously promoted package."
-          try {
-            ./scripts/Invoke-Rollback.ps1 `
-              -AgentName '${{ inputs.agentName }}' `
-              -Environment '${{ inputs.targetEnvironment }}' `
-              -ArtifactDirectory './artifacts' `
-              -ReleaseDirectory './out/releases' `
-              -Reason 'Automatic rollback: run ${{ github.run_id }} failed.' `
-              -Confirm:$false
-          }
-          catch {
-            Write-Host "::error::Automatic rollback failed: $($_.Exception.Message)"
-            Write-Host "::error::Follow the manual procedure in docs/deployment-runbook.md."
-            exit 1
-          }

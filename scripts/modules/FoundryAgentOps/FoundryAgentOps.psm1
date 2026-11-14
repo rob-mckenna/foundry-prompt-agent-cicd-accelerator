@@ -107,6 +107,23 @@ function Resolve-RequiredPath {
     return (Resolve-Path -LiteralPath $Path).Path
 }
 
+function Get-FoundryWorkRoot {
+    [CmdletBinding()]
+    [OutputType([string])]
+    param([string]$DefaultRelativePath = 'out/platform-work')
+    $repository = Get-RepositoryRoot
+    if (-not $env:FOUNDRY_QUALIFICATION_PRIVATE_ROOT) { return (Join-Path $repository $DefaultRelativePath) }
+    $root = [IO.Path]::GetFullPath($env:FOUNDRY_QUALIFICATION_PRIVATE_ROOT)
+    $auth = Join-Path $repository 'out/qualification/authentication'
+    if (-not (Test-PathContainedIn -Root (Join-Path $repository 'out/qualification') -Candidate $root) -or
+        $root.Equals($auth, [StringComparison]::OrdinalIgnoreCase) -or
+        (Test-PathContainedIn -Root $auth -Candidate $root) -or
+        (Test-PathHasReparsePoint -Root $repository -Path $root) -or -not (Test-Path -LiteralPath $root -PathType Container)) {
+        throw 'QUAL_PATH_BLOCKED'
+    }
+    return $root
+}
+
 #endregion
 
 #region Data shaping
@@ -775,6 +792,7 @@ function Get-EnvironmentConfig {
     param(
         [Parameter(Mandatory)][ValidateSet('dev', 'test', 'uat', 'prod')][string]$Environment,
         [string]$ConfigRoot,
+        [hashtable]$RuntimeVariable = @{},
         [switch]$SkipPlaceholderExpansion
     )
 
@@ -796,7 +814,8 @@ function Get-EnvironmentConfig {
     }
 
     if (-not $SkipPlaceholderExpansion) {
-        $config = (Expand-Placeholder -InputObject $config).Value
+        $variables = Get-AllowedRuntimeVariable -EnvironmentConfig $config -RuntimeVariable $RuntimeVariable
+        $config = (Expand-Placeholder -InputObject $config -Variables $variables).Value
     }
 
     $config['_sourcePath'] = $resolved
@@ -1041,7 +1060,6 @@ function ConvertTo-FoundryAgentPayload {
     if ($manifest['model'].Contains('responseFormat') -and $manifest['model']['responseFormat']) {
         $rf = $manifest['model']['responseFormat']
         switch ($rf['type']) {
-            'auto' { $payload['response_format'] = 'auto' }
             'text' { $payload['response_format'] = [ordered]@{ type = 'text' } }
             'json_object' { $payload['response_format'] = [ordered]@{ type = 'json_object' } }
             'json_schema' {
@@ -1052,12 +1070,10 @@ function ConvertTo-FoundryAgentPayload {
                     -ContainmentRoot $containmentRoot -Inventory $inventory -Purpose 'Response format JSON schema'
                 $schemaObject = Read-JsonFile -Path $schemaFile
                 $payload['response_format'] = [ordered]@{
-                    type        = 'json_schema'
-                    json_schema = [ordered]@{
-                        name   = $manifest['name']
-                        strict = $true
-                        schema = $schemaObject
-                    }
+                    type   = 'json_schema'
+                    name   = $manifest['name']
+                    strict = $true
+                    schema = $schemaObject
                 }
             }
             default { throw "Unsupported responseFormat.type '$($rf['type'])'." }
@@ -1168,6 +1184,12 @@ function ConvertTo-FoundryAgentPayload {
                 }
                 if ($config.Contains('allowedTools') -and $config['allowedTools']) {
                     $mcp['allowed_tools'] = @($config['allowedTools'])
+                }
+                if ($config.Contains('requireApproval')) {
+                    if ($config['requireApproval'] -notin @('always', 'never')) {
+                        throw "Unsupported MCP requireApproval '$($config['requireApproval'])' on tool '$($tool['id'])'."
+                    }
+                    $mcp['require_approval'] = $config['requireApproval']
                 }
                 $toolList += , $mcp
             }
@@ -1345,7 +1367,7 @@ function Test-DeploymentGate {
 
     $requirementMap = @{
         smoke      = $gates['requireSmokeTestPass']
-        evaluation = $gates['requireEvaluationPass']
+        evaluation = ($gates['requireEvaluationPass'] -or $null -ne $gates['minimumEvaluationScore'])
         regression = $gates['requireRegressionPass']
     }
 
@@ -1410,46 +1432,148 @@ function Read-GateEvidence {
     param(
         [string]$SmokeResultPath,
         [string]$EvaluationResultPath,
-        [string]$RegressionResultPath
+        [string]$RegressionResultPath,
+        [Parameter(Mandatory)][System.Collections.IDictionary]$ReleaseRecord,
+        [Parameter(Mandatory)][System.Collections.IDictionary]$EnvironmentConfig
     )
 
     $evidence = @{}
-
-    if ($SmokeResultPath -and (Test-Path -LiteralPath $SmokeResultPath)) {
-        $smoke = Read-JsonFile -Path $SmokeResultPath
-        $executed = [int]$smoke['passed'] + [int]$smoke['failed']
-        $evidence['smoke'] = [pscustomobject]@{
-            Executed = $executed
-            Outcome  = $(if ([int]$smoke['failed'] -gt 0) { 'failed' } elseif ($executed -le 0) { 'skipped' } else { 'passed' })
-            Score    = $null
-            Source   = $SmokeResultPath
+    $paths = @{ smoke = $SmokeResultPath; evaluation = $EvaluationResultPath; regression = $RegressionResultPath }
+    foreach ($gate in @('smoke', 'evaluation', 'regression')) {
+        $path = $paths[$gate]
+        if (-not $path) { continue }
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "Supplied $gate evidence file is missing: $path" }
+        $result = Read-JsonFile -Path $path
+        Assert-GateEnvelope -Envelope $result -Record $ReleaseRecord -EnvironmentConfig $EnvironmentConfig -Gate $gate
+        foreach ($counter in @('passed', 'failed', 'liveExecuted')) {
+            if (($result[$counter] -isnot [int] -and $result[$counter] -isnot [long]) -or $result[$counter] -lt 0) {
+                throw "$gate evidence counter '$counter' must be a nonnegative integer."
+            }
+        }
+        $items = @($result[$(@{ smoke = 'checks'; evaluation = 'records'; regression = 'cases' }[$gate])])
+        $passed = 0; $failed = 0; $skipped = 0; $live = 0; $livePassed = 0
+        foreach ($item in $items) {
+            if ($item -isnot [System.Collections.IDictionary] -or $item['Live'] -isnot [bool]) {
+                throw "$gate item lacks an explicit boolean Live marker."
+            }
+            if ($gate -eq 'smoke') {
+                switch ($item['Result']) {
+                    'passed' { $passed++; $ok = $true }
+                    'failed' { $failed++; $ok = $false }
+                    'skipped' { $skipped++; $ok = $false }
+                    default { throw 'Invalid smoke item result.' }
+                }
+            }
+            else {
+                if ($item['Passed'] -isnot [bool]) { throw "$gate item Passed must be boolean." }
+                $ok = $item['Passed']
+                if ($ok) { $passed++ } else { $failed++ }
+            }
+            if ($item['Live']) {
+                $live++
+                if ($ok) {
+                    if ($item['Status'] -cne 'completed' -or
+                        [string]::IsNullOrWhiteSpace([string]$item['ResponseId']) -or
+                        [string]::IsNullOrWhiteSpace([string]$item['ConversationId'])) {
+                        throw "$gate passing live item has no completed Responses call with IDs."
+                    }
+                    $livePassed++
+                }
+            }
+        }
+        if ($passed -ne $result['passed'] -or $failed -ne $result['failed'] -or $live -ne $result['liveExecuted']) {
+            throw "$gate evidence totals do not match detailed items."
+        }
+        if ($gate -eq 'smoke') {
+            if (($result['skipped'] -isnot [int] -and $result['skipped'] -isnot [long]) -or $result['skipped'] -ne $skipped) { throw 'Smoke skipped counter is inconsistent.' }
+            if ($livePassed -le 0) { throw 'Smoke evidence has no successful live canary.' }
+        }
+        elseif (($result['total'] -isnot [int] -and $result['total'] -isnot [long]) -or
+            $result['total'] -ne $items.Count -or $live -ne $items.Count -or $live -le 0) {
+            throw "$gate requires liveExecuted=total>0."
+        }
+        $score = $null
+        $thresholdsMet = $true
+        if ($gate -eq 'evaluation') {
+            $score = $result['passRate']
+            if ($score -isnot [double] -and $score -isnot [int] -and $score -isnot [decimal]) { throw 'Evaluation passRate must be numeric.' }
+            if (-not [double]::IsFinite([double]$score) -or $score -lt 0 -or $score -gt 1 -or
+                [Math]::Abs($score - [Math]::Round($passed / $items.Count, 4)) -gt 0.00001) { throw 'Evaluation passRate is inconsistent.' }
+            $thresholds = $result['thresholds']
+            if ($thresholds -isnot [System.Collections.IDictionary] -or $result['thresholdsMet'] -isnot [bool]) { throw 'Evaluation thresholds and boolean thresholdsMet are required.' }
+            $minimum = $thresholds['minimumPassRate']
+            if (($minimum -isnot [double] -and $minimum -isnot [int] -and $minimum -isnot [decimal]) -or
+                -not [double]::IsFinite([double]$minimum) -or $minimum -lt 0 -or $minimum -gt 1) { throw 'Invalid minimumPassRate.' }
+            $latencies = @($items | ForEach-Object {
+                if (($_['LatencyMs'] -isnot [int] -and $_['LatencyMs'] -isnot [long]) -or $_['LatencyMs'] -lt 0) { throw 'Invalid live latency.' }
+                $_['LatencyMs']
+            } | Sort-Object)
+            $p95 = $latencies[[int][Math]::Ceiling($latencies.Count * 0.95) - 1]
+            if ($result['p95LatencyMs'] -ne $p95) { throw 'Evaluation p95 does not match detailed items.' }
+            $thresholdsMet = $score -ge $minimum
+            foreach ($bound in @('maximumFailures', 'maximumP95LatencyMs')) {
+                if ($thresholds.Contains($bound)) {
+                    if (($thresholds[$bound] -isnot [int] -and $thresholds[$bound] -isnot [long]) -or $thresholds[$bound] -lt 0) { throw "Invalid $bound." }
+                    $actual = if ($bound -eq 'maximumFailures') { $failed } else { $p95 }
+                    $thresholdsMet = $thresholdsMet -and ($actual -le $thresholds[$bound])
+                }
+            }
+            if ($result['thresholdsMet'] -ne $thresholdsMet) { throw 'Evaluation thresholdsMet is inconsistent.' }
+        }
+        $envelope = [ordered]@{}
+        foreach ($key in @('schemaVersion', 'gate', 'mode', 'releaseId', 'packageId', 'agentName', 'environment', 'projectEndpoint', 'agentVersion', 'serviceVersion', 'startedUtc', 'executedUtc', 'liveExecuted')) {
+            $envelope[$key] = $result[$key]
+        }
+        $evidence[$gate] = [pscustomobject]@{
+            Executed = $passed + $failed
+            Outcome = if ($failed -gt 0 -or -not $thresholdsMet) { 'failed' } else { 'passed' }
+            Score = $score; Source = $path; Envelope = $envelope
+            ResultSha256 = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()
         }
     }
-
-    if ($EvaluationResultPath -and (Test-Path -LiteralPath $EvaluationResultPath)) {
-        $evaluation = Read-JsonFile -Path $EvaluationResultPath
-        $executed = [int]$evaluation['total']
-        $passedThresholds = [bool]$evaluation['thresholdsMet']
-        $evidence['evaluation'] = [pscustomobject]@{
-            Executed = $executed
-            Outcome  = $(if ($executed -le 0) { 'skipped' } elseif (-not $passedThresholds -or [int]$evaluation['failed'] -gt 0) { 'failed' } else { 'passed' })
-            Score    = $(if ($evaluation.Contains('passRate')) { [double]$evaluation['passRate'] } else { $null })
-            Source   = $EvaluationResultPath
-        }
-    }
-
-    if ($RegressionResultPath -and (Test-Path -LiteralPath $RegressionResultPath)) {
-        $regression = Read-JsonFile -Path $RegressionResultPath
-        $executed = [int]$regression['total']
-        $evidence['regression'] = [pscustomobject]@{
-            Executed = $executed
-            Outcome  = $(if ($executed -le 0) { 'skipped' } elseif ([int]$regression['failed'] -gt 0) { 'failed' } else { 'passed' })
-            Score    = $null
-            Source   = $RegressionResultPath
-        }
-    }
-
     return $evidence
+}
+
+function Assert-GateEnvelope {
+    param(
+        [System.Collections.IDictionary]$Envelope,
+        [System.Collections.IDictionary]$Record,
+        [System.Collections.IDictionary]$EnvironmentConfig,
+        [string]$Gate
+    )
+    $expected = @{
+        schemaVersion = '1.1.0'; gate = $Gate; mode = 'live'
+        releaseId = $Record['releaseId']; packageId = $Record['packageId']
+        agentName = $Record['agent']['name']; environment = $Record['environment']
+        agentVersion = $Record['agent']['version']; serviceVersion = $Record['agent']['serviceVersion']
+    }
+    foreach ($key in $expected.Keys) {
+        if ($Envelope[$key] -isnot [string] -or [string]::IsNullOrWhiteSpace($expected[$key]) -or $Envelope[$key] -cne $expected[$key]) {
+            throw "$Gate evidence identity '$key' does not match this live release."
+        }
+    }
+    $endpoint = $EnvironmentConfig['foundry']['projectEndpoint'].TrimEnd('/').ToLowerInvariant()
+    if ($Envelope['projectEndpoint'] -isnot [string] -or
+        $Envelope['projectEndpoint'].TrimEnd('/').ToLowerInvariant() -cne $endpoint -or
+        $Record['projectEndpoint'].TrimEnd('/').ToLowerInvariant() -cne $endpoint) { throw "$Gate evidence project endpoint mismatch." }
+    foreach ($key in @('startedUtc', 'executedUtc')) {
+        # ConvertFrom-Json on newer PowerShell versions materializes ISO strings as DateTime.
+        if ($Envelope[$key] -is [DateTime] -and $Envelope[$key].Kind -eq [DateTimeKind]::Utc) {
+            $Envelope[$key] = $Envelope[$key].ToString('o')
+        }
+        if ($Envelope[$key] -isnot [string] -or $Envelope[$key] -notmatch 'Z$') { throw "$Gate $key must be a UTC timestamp." }
+    }
+    $start = [DateTimeOffset]::Parse($Envelope['startedUtc'])
+    $finish = [DateTimeOffset]::Parse($Envelope['executedUtc'])
+    $activationValue = $Record['deployment']['runtimeMutation']['completedAtUtc']
+    if ($activationValue -is [DateTime]) { $activationValue = $activationValue.ToString('o') }
+    $activation = [DateTimeOffset]::Parse($activationValue)
+    if ($start -lt $activation -or $finish -lt $start -or $finish -gt [DateTimeOffset]::UtcNow) {
+        throw "$Gate evidence is stale, future-dated, or has invalid UTC ordering."
+    }
+    if (($Envelope['liveExecuted'] -isnot [int] -and $Envelope['liveExecuted'] -isnot [long]) -or $Envelope['liveExecuted'] -le 0) {
+        throw "$Gate evidence requires at least one live invocation."
+    }
 }
 
 function Test-ChangeRecordId {
@@ -1599,6 +1723,8 @@ function New-ChecksumManifest {
     .PARAMETER ExcludeRelativePath
         Additional package-relative paths to omit. Used to compute the content id without package.json,
         which itself carries the resulting content id and would otherwise be self-referential.
+    .PARAMETER PackageFormat
+        Strict /1 preserves the original culture-sensitive path order. Format /2 uses ordinal ordering.
     .OUTPUTS
         The manifest content as a single string with LF line endings.
     #>
@@ -1606,19 +1732,26 @@ function New-ChecksumManifest {
     param(
         [Parameter(Mandatory)][string]$Root,
         [string]$ChecksumFileName = 'checksums.sha256',
-        [string[]]$ExcludeRelativePath = @()
+        [string[]]$ExcludeRelativePath = @(),
+        [ValidateSet('foundry-agent-package/1', 'foundry-agent-package/2')]
+        [string]$PackageFormat = 'foundry-agent-package/2'
     )
 
     $rootResolved = Resolve-RequiredPath -Path $Root -Purpose 'Package root'
     $lines = @()
-    $files = Get-ChildItem -LiteralPath $rootResolved -Recurse -File |
+    $files = @(Get-ChildItem -LiteralPath $rootResolved -Recurse -File |
     Where-Object { $_.Name -ne $ChecksumFileName } |
-    Where-Object { $ExcludeRelativePath -notcontains (Get-NormalizedRelativePath -Root $rootResolved -Path $_.FullName) } |
-    Sort-Object { (Get-NormalizedRelativePath -Root $rootResolved -Path $_.FullName) }
+    Where-Object { $ExcludeRelativePath -notcontains (Get-NormalizedRelativePath -Root $rootResolved -Path $_.FullName) })
+    if ($PackageFormat -eq 'foundry-agent-package/1') {
+        $files = @($files | Sort-Object { Get-NormalizedRelativePath -Root $rootResolved -Path $_.FullName })
+    }
+    $paths = [string[]]@($files | ForEach-Object { Get-NormalizedRelativePath -Root $rootResolved -Path $_.FullName })
+    if ($PackageFormat -eq 'foundry-agent-package/2') {
+        [Array]::Sort($paths, [StringComparer]::Ordinal)
+    }
 
-    foreach ($file in $files) {
-        $relative = Get-NormalizedRelativePath -Root $rootResolved -Path $file.FullName
-        $hash = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+    foreach ($relative in $paths) {
+        $hash = (Get-FileHash -LiteralPath (Join-Path $rootResolved $relative) -Algorithm SHA256).Hash.ToLowerInvariant()
         $lines += "$hash  $relative"
     }
 
@@ -1632,12 +1765,16 @@ function ConvertTo-CanonicalJson {
     .DESCRIPTION
         Used to fold the package descriptor into the content address. Sorting keys means the hash does not
         depend on property order, so the build stays reproducible while every descriptor field is covered.
+    .PARAMETER PackageFormat
+        Strict /1 preserves Sort-Object -CaseSensitive collation. Format /2 uses ordinal ordering.
     #>
     [CmdletBinding()]
     [OutputType([string])]
     param(
         [Parameter(Mandatory)][AllowNull()]$InputObject,
-        [string[]]$ExcludeTopLevelKey = @()
+        [string[]]$ExcludeTopLevelKey = @(),
+        [ValidateSet('foundry-agent-package/1', 'foundry-agent-package/2')]
+        [string]$PackageFormat = 'foundry-agent-package/2'
     )
 
     function Write-Node {
@@ -1650,7 +1787,14 @@ function ConvertTo-CanonicalJson {
         }
         if ($Node -is [System.Collections.IDictionary]) {
             $parts = @()
-            foreach ($key in ($Node.Keys | Sort-Object -CaseSensitive)) {
+            $keys = [string[]]@($Node.Keys)
+            if ($PackageFormat -eq 'foundry-agent-package/1') {
+                $keys = @($Node.Keys | Sort-Object -CaseSensitive)
+            }
+            else {
+                [Array]::Sort($keys, [StringComparer]::Ordinal)
+            }
+            foreach ($key in $keys) {
                 $parts += (ConvertTo-Json -InputObject ([string]$key) -Compress) + ':' + (Write-Node -Node $Node[$key])
             }
             return '{' + ($parts -join ',') + '}'
@@ -1679,24 +1823,38 @@ function Get-PackageId {
     .SYNOPSIS
         Computes the content address of a package from its checksum manifest and canonical descriptor.
     .DESCRIPTION
-        The address covers both the file content and the descriptor's identity and provenance fields. Only
-        'packageId' itself is excluded from the descriptor, which avoids a circular hash while still binding
-        agent name, version, owner, classification, build provenance and the file inventory into the id.
-
-        Format: sha256 over "foundry-agent-package/1\n<canonical descriptor>\n<checksum manifest>".
+        Format /2 binds the stable descriptor projection and source checksums, excluding packageId and
+        informational build time/run/builder/ref fields. Strict /1 excludes only packageId. Unknown formats
+        fail; there is no checksum-only compatibility fallback.
     #>
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][string]$ChecksumManifest,
-        [System.Collections.IDictionary]$Descriptor
+        [Parameter(Mandatory)][System.Collections.IDictionary]$Descriptor
     )
 
-    $descriptorJson = if ($Descriptor) {
-        ConvertTo-CanonicalJson -InputObject $Descriptor -ExcludeTopLevelKey @('packageId')
+    $format = [string]$Descriptor['packageFormat']
+    if ($format -notin @('foundry-agent-package/1', 'foundry-agent-package/2')) {
+        throw "Unsupported package format '$format'."
     }
-    else { '' }
-
-    $payload = "foundry-agent-package/1`n$descriptorJson`n$ChecksumManifest"
+    $projection = ConvertTo-OrderedHashtable -InputObject ($Descriptor | ConvertTo-Json -Depth 64 | ConvertFrom-Json -Depth 64)
+    if ($format -eq 'foundry-agent-package/2') {
+        foreach ($field in @('createdUtc', 'buildRunId', 'buildRunUrl', 'builder', 'sourceRef')) {
+            if ($projection.Contains('build')) { $projection['build'].Remove($field) }
+        }
+        foreach ($field in @('environments', 'tools', 'evaluations', 'attachments')) {
+            if ($projection['contents'].Contains($field)) {
+                $items = [string[]]@($projection['contents'][$field])
+                [Array]::Sort($items, [StringComparer]::Ordinal)
+                $projection['contents'][$field] = $items
+            }
+        }
+    }
+    $descriptorJson = ConvertTo-CanonicalJson -InputObject $projection -ExcludeTopLevelKey @('packageId') -PackageFormat $format
+    if ($format -eq 'foundry-agent-package/2') {
+        $ChecksumManifest = $ChecksumManifest.Replace("`r`n", "`n").TrimEnd("`n") + "`n"
+    }
+    $payload = "$format`n$descriptorJson`n$ChecksumManifest"
     $bytes = [System.Text.UTF8Encoding]::new($false).GetBytes($payload)
     $sha = [System.Security.Cryptography.SHA256]::Create()
     try {
@@ -1754,7 +1912,8 @@ function Test-ChecksumManifest {
     $descriptorPath = Join-Path $rootResolved 'package.json'
     if (Test-Path -LiteralPath $descriptorPath) { $descriptor = Read-JsonFile -Path $descriptorPath }
 
-    $contentManifest = New-ChecksumManifest -Root $rootResolved -ChecksumFileName $ChecksumFileName -ExcludeRelativePath $ContentIdExclude
+    $contentManifest = New-ChecksumManifest -Root $rootResolved -ChecksumFileName $ChecksumFileName `
+        -ExcludeRelativePath $ContentIdExclude -PackageFormat $descriptor['packageFormat']
 
     return [pscustomobject]@{
         Root                 = $rootResolved
@@ -1762,7 +1921,7 @@ function Test-ChecksumManifest {
         Missing              = $missing
         Extra                = $extra
         Modified             = $modified
-        ChecksumManifestHash = (Get-PackageId -ChecksumManifest $manifestText)
+        ChecksumManifestHash = 'sha256:' + (Get-FileHash -LiteralPath $manifestPath -Algorithm SHA256).Hash.ToLowerInvariant()
         ContentId            = (Get-PackageId -ChecksumManifest $contentManifest -Descriptor $descriptor)
     }
 }
@@ -1795,6 +1954,20 @@ function Test-PackageIdentity {
     }
     if ($Descriptor['agent']['version'] -ne $manifest['version']) {
         $problems += "Descriptor declares version '$($Descriptor['agent']['version'])' but the packaged manifest is '$($manifest['version'])'."
+    }
+    foreach ($field in @('owner', 'classification')) {
+        if ((ConvertTo-CanonicalJson -InputObject $Descriptor['agent'][$field]) -cne
+            (ConvertTo-CanonicalJson -InputObject $manifest[$field])) { $problems += "Descriptor $field does not match the packaged manifest." }
+    }
+    if ($Descriptor.Contains('fileCount') -and $Descriptor['fileCount'] -ne $inventory.Count) {
+        $problems += 'Descriptor fileCount does not match the verified inventory.'
+    }
+    foreach ($field in @('tools', 'evaluations', 'attachments')) {
+        if ($Descriptor['contents'].Contains($field)) {
+            foreach ($reference in $Descriptor['contents'][$field]) {
+                if (-not $inventory.ContainsKey($reference)) { $problems += "Descriptor inventory entry '$reference' is missing." }
+            }
+        }
     }
 
     $instructionsReference = $Descriptor['contents']['instructions']
@@ -1955,8 +2128,19 @@ function Publish-AgentPackage {
     if ($LASTEXITCODE -ne 0) {
         # A blob that already exists is the expected outcome for a content-addressed store.
         if (($output | Out-String) -match 'BlobAlreadyExists|already exists') {
-            Write-OpsLog -Level Info -Message "Package $PackageId is already present in the package store."
-            return $uri
+            $scratch = Join-Path (Get-FoundryWorkRoot -DefaultRelativePath 'out') "publication-$([Guid]::NewGuid().ToString('n'))"
+            New-Item -ItemType Directory -Force -Path $scratch | Out-Null
+            try {
+                $retained = Get-AgentPackageFromStore -AgentName $AgentName -PackageId $PackageId -EnvironmentConfig $EnvironmentConfig -Destination (Join-Path $scratch 'retained.zip')
+                if (-not $retained -or
+                    (Get-FileHash -LiteralPath $retained -Algorithm SHA256).Hash -ne
+                    (Get-FileHash -LiteralPath $PackagePath -Algorithm SHA256).Hash) {
+                    throw "Archive byte conflict for existing package $PackageId. Retain the original archive; never overwrite it."
+                }
+                Write-OpsLog -Level Info -Message "Existing package $PackageId has identical archive bytes."
+                return $uri
+            }
+            finally { Remove-Item -LiteralPath $scratch -Recurse -Force -Confirm:$false }
         }
         throw "Failed to upload the package to '$uri'. Confirm the deployment identity holds 'Storage Blob Data Contributor' on the container. Azure CLI reported: $(($output | Out-String).Trim())"
     }
@@ -2025,7 +2209,7 @@ function Find-AgentPackage {
     foreach ($directory in $SearchDirectory) {
         if (-not $directory -or -not (Test-Path -LiteralPath $directory)) { continue }
         foreach ($candidate in (Get-ChildItem -LiteralPath $directory -Recurse -Filter '*.zip' -File)) {
-            $extractRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("foundry-find-" + [Guid]::NewGuid().ToString('n'))
+            $extractRoot = Join-Path (Get-FoundryWorkRoot) ("foundry-find-" + [Guid]::NewGuid().ToString('n'))
             try {
                 $root = Expand-AgentPackage -PackagePath $candidate.FullName -Destination $extractRoot
                 $descriptor = Read-PackageDescriptor -PackageRoot $root
@@ -2046,7 +2230,7 @@ function Find-AgentPackage {
         $target = Join-Path $DownloadDirectory "$AgentName-$($PackageId -replace '^sha256:', '').zip"
         $downloaded = Get-AgentPackageFromStore -AgentName $AgentName -PackageId $PackageId -EnvironmentConfig $EnvironmentConfig -Destination $target
         if ($downloaded) {
-            $extractRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("foundry-find-" + [Guid]::NewGuid().ToString('n'))
+            $extractRoot = Join-Path (Get-FoundryWorkRoot) ("foundry-find-" + [Guid]::NewGuid().ToString('n'))
             try {
                 $root = Expand-AgentPackage -PackagePath $downloaded -Destination $extractRoot
                 $descriptor = Read-PackageDescriptor -PackageRoot $root
@@ -2075,6 +2259,7 @@ function Get-FoundryAccessToken {
         federation service connection (Azure DevOps). No secret is accepted or emitted by this function; the
         token is returned as a SecureString and is never written to the console.
     #>
+    [System.Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingConvertToSecureStringWithPlainText', '', Justification = 'Converts the runtime Azure CLI access-token response to the existing SecureString return contract; no source-embedded credential.')]
     [CmdletBinding()]
     [OutputType([securestring])]
     param(
@@ -2176,10 +2361,10 @@ function Invoke-FoundryApi {
 function Test-FoundryEndpoint {
     <#
     .SYNOPSIS
-        Confirms that the configured endpoint and api-version answer a read-only list call before any mutation.
+        Confirms that the configured project endpoint and SDK authentication support a read-only list call.
     .DESCRIPTION
-        The Agent Service api-version and path surface change between preview and GA releases. This preflight
-        turns a silent shape mismatch into an explicit, actionable failure.
+        The Azure AI Projects SDK selects its own service API version. This preflight does not consume or
+        validate the apiVersion retained in environment configuration for REST runtime tests and export-by-id.
     #>
     [CmdletBinding()]
     param(
@@ -2187,16 +2372,9 @@ function Test-FoundryEndpoint {
         [securestring]$AccessToken
     )
 
-    $foundry = $EnvironmentConfig['foundry']
-    if (-not $AccessToken) {
-        $tenantId = if ($EnvironmentConfig['azure'].Contains('tenantId')) { [string]$EnvironmentConfig['azure']['tenantId'] } else { $null }
-        $AccessToken = Get-FoundryAccessToken -Scope $foundry['tokenScope'] -TenantId $tenantId
-    }
+    $result = Invoke-FoundryPythonCli -Subcommand 'preflight' -EnvironmentConfig $EnvironmentConfig
 
-    $result = Invoke-FoundryApi -Endpoint $foundry['projectEndpoint'] -Path '/assistants?limit=1' `
-        -ApiVersion $foundry['apiVersion'] -AccessToken $AccessToken -Method GET
-
-    Write-OpsLog -Level Success -Message "Agent Service preflight succeeded for project endpoint (api-version $($foundry['apiVersion']))."
+    Write-OpsLog -Level Success -Message 'Azure AI Projects SDK preflight succeeded for the project endpoint.'
     return $result
 }
 
@@ -2205,159 +2383,199 @@ function Get-FoundryAgent {
     .SYNOPSIS
         Finds the managed agent for a logical name in the target project.
     .DESCRIPTION
-        Agent Service names are not unique, so discovery matches on metadata written by this accelerator
-        (managed_by + logical_name). A known remote id short-circuits the scan.
+        When -LogicalName is non-empty, reads the agent directly by logical name through the Azure AI Projects
+        SDK and returns separate active/latest versions, with configuration from the active version.
+        When only -KnownAgentId is supplied, falls back to the retained REST GET /assistants/{id} path
+        for legacy/manual export scenarios because the SDK does not expose a get-by-id operation.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][System.Collections.IDictionary]$EnvironmentConfig,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$LogicalName,
+        [string]$KnownAgentId,
+        [securestring]$AccessToken
+    )
+
+    if (-not [string]::IsNullOrWhiteSpace($LogicalName)) {
+        $result = Invoke-FoundryPythonCli -Subcommand 'get-agent' -EnvironmentConfig $EnvironmentConfig -LogicalName $LogicalName
+        if (-not $result -or -not $result.found) { return $null }
+
+        $agent = [ordered]@{
+            id            = $result.id
+            name          = $result.name
+            latestVersion = $result.latestVersion
+        }
+
+        if ($result.PSObject.Properties.Name -contains 'agentEndpoint') {
+            $agent['agent_endpoint'] = $result.agentEndpoint
+        }
+        if ($result.PSObject.Properties.Name -contains 'description') {
+            $agent['description'] = $result.description
+        }
+        if ($result.PSObject.Properties.Name -contains 'metadata') {
+            $agent['metadata'] = $result.metadata
+        }
+        if ($result.PSObject.Properties.Name -contains 'definition') {
+            $agent['definition'] = $result.definition
+        }
+        foreach ($property in @('activeVersion', 'state', 'instructions', 'model', 'reasoning', 'structured_inputs', 'text', 'tools', 'top_p', 'temperature', 'version', 'versionId')) {
+            if ($result.PSObject.Properties.Name -contains $property) {
+                $agent[$property] = $result.$property
+            }
+        }
+
+        return [pscustomobject]$agent
+    }
+
+    if ([string]::IsNullOrWhiteSpace($KnownAgentId)) {
+        throw "Supply either -LogicalName for SDK discovery or -KnownAgentId for the retained REST get-by-id fallback."
+    }
+    if (-not $AccessToken) {
+        throw "Get-FoundryAgent requires -AccessToken when using the retained REST get-by-id fallback for KnownAgentId '$KnownAgentId'."
+    }
+
+    $foundry = $EnvironmentConfig['foundry']
+    $response = Invoke-FoundryApi -Endpoint $foundry['projectEndpoint'] -Path "/assistants/$KnownAgentId" `
+        -ApiVersion $foundry['apiVersion'] -AccessToken $AccessToken -Method GET
+    return $response.Content
+}
+
+function New-FoundryAgentVersion {
+    <#
+    .SYNOPSIS
+        Creates a new agent version from a resolved payload through the Azure AI Projects SDK.
     #>
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][System.Collections.IDictionary]$EnvironmentConfig,
         [Parameter(Mandatory)][string]$LogicalName,
-        [string]$KnownAgentId,
-        [Parameter(Mandatory)][securestring]$AccessToken
+        [Parameter(Mandatory)][System.Collections.IDictionary]$Payload,
+        [switch]$DisableCreateRetries
     )
 
-    $foundry = $EnvironmentConfig['foundry']
-
-    if ($KnownAgentId) {
-        $response = Invoke-FoundryApi -Endpoint $foundry['projectEndpoint'] -Path "/assistants/$KnownAgentId" `
-            -ApiVersion $foundry['apiVersion'] -AccessToken $AccessToken -Method GET
-        return $response.Content
-    }
-
-    $after = $null
-    for ($page = 0; $page -lt 20; $page++) {
-        $path = '/assistants?limit=100&order=desc'
-        if ($after) { $path += "&after=$after" }
-        $response = Invoke-FoundryApi -Endpoint $foundry['projectEndpoint'] -Path $path `
-            -ApiVersion $foundry['apiVersion'] -AccessToken $AccessToken -Method GET
-        $body = $response.Content
-        if ($null -eq $body -or -not $body.PSObject.Properties.Name.Contains('data')) {
-            throw "Unexpected response shape from GET /assistants. Expected a 'data' collection. Check the configured api-version '$($foundry['apiVersion'])'."
-        }
-        foreach ($item in $body.data) {
-            if ($null -eq $item.metadata) { continue }
-            $metadataProperties = $item.metadata.PSObject.Properties.Name
-            if ($metadataProperties -contains 'managed_by' -and $metadataProperties -contains 'logical_name') {
-                if ($item.metadata.managed_by -eq $script:ManagedByTag -and $item.metadata.logical_name -eq $LogicalName) {
-                    return $item
-                }
-            }
-        }
-        if (-not $body.has_more) { break }
-        $after = $body.last_id
-    }
-
-    return $null
+    return Invoke-FoundryPythonCli -Subcommand 'create-version' -EnvironmentConfig $EnvironmentConfig -LogicalName $LogicalName -InputObject $Payload -DisableCreateRetries:$DisableCreateRetries
 }
 
-function Invoke-FoundryAgentRun {
+function Set-FoundryAgentActiveVersion {
     <#
     .SYNOPSIS
-        Sends one prompt to a deployed agent and returns the assistant reply, status and latency.
-    .DESCRIPTION
-        Creates a thread and run, polls until the run reaches a terminal state, reads the newest assistant
-        message and then deletes the thread. Used by the smoke, regression and evaluation runners.
-
-        A run that stops in 'requires_action' is returned as-is: a client-side function tool cannot be
-        satisfied from CI, and reporting it honestly is better than treating it as a pass or a failure.
-    .PARAMETER Prompt
-        User message to send.
-    .PARAMETER AgentId
-        Agent Service assistant id.
+        Promotes one agent version to 100% traffic through the Azure AI Projects SDK.
     #>
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][System.Collections.IDictionary]$EnvironmentConfig,
-        [Parameter(Mandatory)][string]$AgentId,
-        [Parameter(Mandatory)][string]$Prompt,
-        [Parameter(Mandatory)][securestring]$AccessToken,
-        [int]$TimeoutSeconds = 120,
-        [int]$PollIntervalSeconds = 2
+        [Parameter(Mandatory)][string]$LogicalName,
+        [Parameter(Mandatory)][string]$AgentVersion
     )
 
-    $foundry = $EnvironmentConfig['foundry']
-    $endpoint = $foundry['projectEndpoint']
-    $apiVersion = $foundry['apiVersion']
-    $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
-    $threadId = $null
+    return Invoke-FoundryPythonCli -Subcommand 'promote-version' -EnvironmentConfig $EnvironmentConfig -LogicalName $LogicalName -AgentVersion $AgentVersion
+}
 
-    try {
-        $createBody = [ordered]@{
-            assistant_id = $AgentId
-            thread       = [ordered]@{
-                messages = @(
-                    [ordered]@{ role = 'user'; content = $Prompt }
-                )
+function Invoke-FoundryAgentRun {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][System.Collections.IDictionary]$EnvironmentConfig,
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$LogicalName,
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$AgentVersion,
+        [Parameter(Mandatory)][string]$Prompt,
+        [ValidateRange(1, 600)][int]$TimeoutSeconds = 120,
+        [ValidateRange(1, 600)][int]$PollIntervalSeconds = 2
+    )
+
+    $result = Invoke-FoundryPythonCli -Subcommand 'invoke-agent' -EnvironmentConfig $EnvironmentConfig `
+        -LogicalName $LogicalName -AgentVersion $AgentVersion -InputObject @{
+            prompt = $Prompt; timeoutSeconds = $TimeoutSeconds; pollIntervalSeconds = $PollIntervalSeconds
+        } -ProcessTimeoutSeconds ($TimeoutSeconds + 10)
+    if ($env:FOUNDRY_QUALIFICATION_PRIVATE_ROOT) {
+        $root = Get-FoundryWorkRoot
+        $value = ConvertTo-OrderedHashtable -InputObject $result
+        $cleanup = if ($value -is [System.Collections.IDictionary] -and $value.Contains('InvocationCleanup')) {
+            $value['InvocationCleanup']
+        } else { $null }
+        $primary = if ($value -is [System.Collections.IDictionary] -and $value.Contains('PrimaryStatus') -and
+            $value['PrimaryStatus'] -is [string] -and
+            $value['PrimaryStatus'] -cin @('completed','failed','timeout','incomplete','cancelled','requires_action','queued','in_progress')) {
+            $value['PrimaryStatus']
+        } else { 'unknown' }
+        $categories = @('conversation-delete-failed','conversation-creation-unverified',
+            'openai-client-close-failed','project-client-close-failed','credential-close-failed')
+        $valid = $cleanup -is [System.Collections.IDictionary] -and $cleanup.Count -eq 4 -and
+            $cleanup.Contains('verified') -and $cleanup['verified'] -is [bool] -and
+            $cleanup.Contains('resourcesClosed') -and $cleanup['resourcesClosed'] -is [bool] -and
+            $cleanup.Contains('conversationDisposition') -and
+            $cleanup['conversationDisposition'] -is [string] -and
+            $cleanup['conversationDisposition'] -cin @('deleted','not-created','failed','unverified') -and
+            $cleanup.Contains('failureCategories') -and $cleanup['failureCategories'] -is [array] -and
+            $cleanup['failureCategories'].Count -le 5 -and
+            @($cleanup['failureCategories'] | Where-Object { $_ -isnot [string] -or $_ -cnotin $categories }).Count -eq 0 -and
+            $primary -cne 'unknown'
+        if ($valid -and $cleanup['verified']) {
+            if (-not $cleanup['resourcesClosed'] -or $cleanup['failureCategories'].Count -ne 0 -or
+                $cleanup['conversationDisposition'] -cnotin @('deleted','not-created') -or
+                ($cleanup['conversationDisposition'] -ceq 'deleted' -and
+                    (-not $value.Contains('ConversationId') -or -not $value['ConversationId'])) -or
+                ($cleanup['conversationDisposition'] -ceq 'not-created' -and
+                    ($primary -ceq 'completed' -or ($value.Contains('ConversationId') -and $value['ConversationId'])))) {
+                $valid = $false
             }
-        }
-        $created = Invoke-FoundryApi -Endpoint $endpoint -Path '/threads/runs' -ApiVersion $apiVersion `
-            -AccessToken $AccessToken -Method POST -Body $createBody
-        $run = $created.Content
-        $threadId = $run.thread_id
-        $runId = $run.id
-        if ([string]::IsNullOrWhiteSpace($threadId) -or [string]::IsNullOrWhiteSpace($runId)) {
-            throw "Agent Service did not return thread_id and id from POST /threads/runs. Check api-version '$apiVersion'."
-        }
-
-        $terminal = @('completed', 'failed', 'cancelled', 'expired', 'requires_action')
-        $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
-        while ($terminal -notcontains $run.status) {
-            if ([DateTime]::UtcNow -gt $deadline) {
-                return [pscustomobject]@{
-                    Output    = $null
-                    Status    = 'timeout'
-                    LatencyMs = [int]$stopwatch.ElapsedMilliseconds
-                    ThreadId  = $threadId
-                    RunId     = $runId
-                    Error     = "Run did not reach a terminal state within $TimeoutSeconds seconds (last status '$($run.status)')."
+        } elseif ($valid -and $cleanup['failureCategories'].Count -eq 0) { $valid = $false }
+        if (-not $valid -or -not $cleanup['verified']) {
+            $category = if ($valid) { 'QUAL_INVOCATION_CLEANUP_FAILED' } else { 'QUAL_INVOCATION_CLEANUP_UNVERIFIED' }
+            $receipt = [ordered]@{
+                category = $category; primaryStatus = $primary; primaryCategory = "invocation-$primary"
+                invocationCleanupVerified = $false
+                cleanupCategories = @(if ($valid) { $cleanup['failureCategories'] } else { 'invalid-envelope' })
+            }
+            foreach ($key in @('ResponseId','ConversationId')) {
+                if ($value -is [System.Collections.IDictionary] -and $value.Contains($key) -and
+                    $value[$key] -is [string] -and $value[$key] -cmatch '^[A-Za-z0-9._:/-]{1,512}$') {
+                    $receipt[$key] = $value[$key]
                 }
             }
-            Start-Sleep -Seconds $PollIntervalSeconds
-            $polled = Invoke-FoundryApi -Endpoint $endpoint -Path "/threads/$threadId/runs/$runId" `
-                -ApiVersion $apiVersion -AccessToken $AccessToken -Method GET
-            $run = $polled.Content
-        }
-
-        $output = $null
-        $errorMessage = $null
-        if ($run.status -eq 'completed') {
-            $messages = Invoke-FoundryApi -Endpoint $endpoint -Path "/threads/$threadId/messages?limit=10&order=desc" `
-                -ApiVersion $apiVersion -AccessToken $AccessToken -Method GET
-            foreach ($message in $messages.Content.data) {
-                if ($message.role -ne 'assistant') { continue }
-                $parts = @()
-                foreach ($block in $message.content) {
-                    if ($block.type -eq 'text') { $parts += $block.text.value }
-                }
-                $output = ($parts -join "`n").Trim()
-                break
-            }
-        }
-        elseif ($run.PSObject.Properties.Name -contains 'last_error' -and $run.last_error) {
-            $errorMessage = "$($run.last_error.code): $($run.last_error.message)"
-        }
-
-        return [pscustomobject]@{
-            Output    = $output
-            Status    = $run.status
-            LatencyMs = [int]$stopwatch.ElapsedMilliseconds
-            ThreadId  = $threadId
-            RunId     = $runId
-            Error     = $errorMessage
-        }
-    }
-    finally {
-        $stopwatch.Stop()
-        if ($threadId) {
             try {
-                $null = Invoke-FoundryApi -Endpoint $endpoint -Path "/threads/$threadId" -ApiVersion $apiVersion `
-                    -AccessToken $AccessToken -Method DELETE
-            }
-            catch [System.Management.Automation.RuntimeException] {
-                Write-OpsLog -Level Warning -Message "Test thread $threadId could not be deleted: $($_.Exception.Message)"
-            }
+                Write-JsonFile -InputObject $receipt -Path (Join-Path $root "invocation-cleanup-$([guid]::NewGuid().ToString('n')).json") `
+                    -Depth 8 -Confirm:$false -WhatIf:$false | Out-Null
+            } catch { throw 'QUAL_INVOCATION_CLEANUP_UNVERIFIED' }
+            throw $category
         }
     }
+    return $result
+}
+
+function Get-FoundryReleaseTarget {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$ReleaseRecordPath,
+        [Parameter(Mandatory)][System.Collections.IDictionary]$EnvironmentConfig
+    )
+    $record = Read-ReleaseRecordFile -Path $ReleaseRecordPath
+    $mutation = $record['deployment']['runtimeMutation']
+    if ($record['schemaVersion'] -ne '1.1.0' -or
+        $record['environment'] -ne $EnvironmentConfig['environment'] -or
+        -not $mutation -or $mutation['started'] -isnot [bool] -or $mutation['started'] -ne $true -or
+        $mutation['completed'] -isnot [bool] -or $mutation['completed'] -ne $true -or
+        $mutation['stage'] -ne 'activated' -or -not $mutation['completedAtUtc'] -or
+        -not $record['agent']['serviceVersion'] -or -not $record['agent']['serviceVersionId'] -or
+        $mutation['candidateVersion'] -cne $record['agent']['serviceVersion']) {
+        throw 'Release target lacks completed mutation/service identity or does not match the configured environment.'
+    }
+    if ($record['projectEndpoint'].TrimEnd('/').ToLowerInvariant() -cne
+        $EnvironmentConfig['foundry']['projectEndpoint'].TrimEnd('/').ToLowerInvariant()) {
+        throw 'Release target project endpoint does not match configuration.'
+    }
+    $agent = Get-FoundryAgent -EnvironmentConfig $EnvironmentConfig -LogicalName $record['agent']['name']
+    if (-not $agent -or $agent.activeVersion -cne $record['agent']['serviceVersion'] -or
+        $agent.id -cne $record['agent']['remoteAgentId'] -or $agent.versionId -cne $record['agent']['serviceVersionId']) {
+        throw 'Release target does not match the actual supported active selection and service identity.'
+    }
+    $identity = [ordered]@{
+        schemaVersion = '1.1.0'; mode = 'live'
+        releaseId = $record['releaseId']; packageId = $record['packageId']
+        agentName = $record['agent']['name']; environment = $record['environment']
+        projectEndpoint = $EnvironmentConfig['foundry']['projectEndpoint'].TrimEnd('/').ToLowerInvariant()
+        agentVersion = $record['agent']['version']; serviceVersion = $record['agent']['serviceVersion']
+    }
+    return [pscustomobject]@{ Record = $record; Agent = $agent; Identity = $identity }
 }
 
 function Resolve-SecretReference {
@@ -2368,6 +2586,7 @@ function Resolve-SecretReference {
         Uses the signed-in workload identity. The value is returned as a SecureString and must never be
         converted to plain text for logging, pipeline variables or command line arguments.
     #>
+    [System.Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingConvertToSecureStringWithPlainText', '', Justification = 'Converts a runtime Azure CLI Key Vault lookup result to the existing SecureString return contract; source contains only the validated reference.')]
     [CmdletBinding()]
     [OutputType([securestring])]
     param([Parameter(Mandatory)][string]$Reference)
@@ -2410,7 +2629,11 @@ function New-ReleaseRecord {
         [string]$PackageUri,
         [string]$SourceEnvironment,
         [hashtable]$GateResults,
-        [System.Collections.IDictionary]$Previous
+        [System.Collections.IDictionary]$Previous,
+        [string]$ChangeRecordId,
+        [string]$BusinessSignoffId,
+        [string]$OriginalChangeRecordId,
+        [string]$RollbackReason
     )
 
     $timestamp = [DateTime]::UtcNow
@@ -2432,6 +2655,7 @@ function New-ReleaseRecord {
         deployedBy    = $deployedBy
         outcome       = $Outcome
         operation     = $Operation
+        runtimeMutation = [ordered]@{ started = $false; completed = $false; stage = 'prepared' }
     }
     if ($SourceEnvironment) { $deployment['sourceEnvironment'] = $SourceEnvironment }
     if ($pipelineUrl) { $deployment['pipelineRunUrl'] = $pipelineUrl }
@@ -2449,13 +2673,26 @@ function New-ReleaseRecord {
     }
     if ($RemoteAgentId) { $agent['remoteAgentId'] = $RemoteAgentId }
 
+    $governance = [ordered]@{}
+    if ($PackageDescriptor['agent'].Contains('classification') -and
+        $PackageDescriptor['agent']['classification'] -and
+        $PackageDescriptor['agent']['classification'].Contains('responsibleAiReviewId') -and
+        $PackageDescriptor['agent']['classification']['responsibleAiReviewId']) {
+        $governance['responsibleAiReviewId'] = [string]$PackageDescriptor['agent']['classification']['responsibleAiReviewId']
+    }
+    if ($ChangeRecordId) { $governance['changeRecordId'] = $ChangeRecordId }
+    if ($BusinessSignoffId) { $governance['businessSignoffId'] = $BusinessSignoffId }
+    if ($OriginalChangeRecordId) { $governance['originalChangeRecordId'] = $OriginalChangeRecordId }
+    if ($RollbackReason) { $governance['rollbackReason'] = $RollbackReason }
+
     $record = [ordered]@{
         '$schema'     = '../schemas/release-record.schema.json'
-        schemaVersion = '1.0.0'
-        releaseId     = "$($PackageDescriptor['agent']['name'])-$Environment-$($timestamp.ToString('yyyyMMddTHHmmssZ'))-$shortId"
+        schemaVersion = '1.1.0'
+        releaseId     = "$($PackageDescriptor['agent']['name'])-$Environment-$($timestamp.ToString('yyyyMMddTHHmmssZ'))-$shortId-$([Guid]::NewGuid().ToString('n').Substring(0,8))"
         environment   = $Environment
         packageId     = $PackageDescriptor['packageId']
         agent         = $agent
+        governance    = $governance
         deployment    = $deployment
     }
     if ($PackageUri) { $record['packageUri'] = $PackageUri }
@@ -2496,10 +2733,16 @@ function Test-ReleaseRecordForPromotion {
         [Parameter(Mandatory)][System.Collections.IDictionary]$Record,
         [Parameter(Mandatory)][string]$AgentName,
         [Parameter(Mandatory)][string]$PackageId,
-        [Parameter(Mandatory)][string]$SourceEnvironment
+        [Parameter(Mandatory)][string]$SourceEnvironment,
+        [Parameter(Mandatory)][System.Collections.IDictionary]$ExpectedGates
     )
 
     $problems = @()
+    if ($Record['schemaVersion'] -ne '1.1.0' -or
+        -not $Record['agent']['serviceVersion'] -or -not $Record['agent']['serviceVersionId'] -or
+        -not $Record['agent']['remoteAgentId'] -or -not $Record['projectEndpoint']) {
+        $problems += 'record lacks the new release/service identity contract; legacy records are audit-only'
+    }
     if ($Record['agent']['name'] -ne $AgentName) {
         $problems += "record is for agent '$($Record['agent']['name'])', not '$AgentName'"
     }
@@ -2513,13 +2756,97 @@ function Test-ReleaseRecordForPromotion {
     if ($outcome -ne 'succeeded') {
         $problems += "record outcome is '$outcome'. Only a deployment attested as 'succeeded' after its post-deployment gates may be promoted"
     }
+    if (-not $Record['deployment'].Contains('runtimeMutation') -or
+        $Record['deployment']['runtimeMutation']['started'] -isnot [bool] -or
+        $Record['deployment']['runtimeMutation']['completed'] -isnot [bool] -or
+        $Record['deployment']['runtimeMutation']['started'] -ne $true -or
+        $Record['deployment']['runtimeMutation']['completed'] -ne $true -or
+        $Record['deployment']['runtimeMutation']['stage'] -ne 'activated' -or
+        $Record['deployment']['runtimeMutation']['candidateVersion'] -cne $Record['agent']['serviceVersion'] -or
+        -not $Record['deployment']['runtimeMutation']['completedAtUtc']) {
+        $problems += 'record does not contain completed runtime mutation evidence'
+    }
     if (-not $Record['deployment'].Contains('attestation') -or -not $Record['deployment']['attestation']) {
         $problems += 'record carries no gate attestation. Run Complete-Release.ps1 in the source environment before promoting'
     }
     else {
         $attestation = $Record['deployment']['attestation']
-        if (-not $attestation.Contains('gatesSatisfied') -or $attestation['gatesSatisfied'] -ne $true) {
+        if (-not $attestation.Contains('gatesSatisfied') -or $attestation['gatesSatisfied'] -isnot [bool] -or $attestation['gatesSatisfied'] -ne $true) {
             $problems += 'record attestation does not report gatesSatisfied'
+        }
+        foreach ($field in @('attestedAtUtc', 'attestedBy', 'requiredGates', 'evidence')) {
+            if (-not $attestation.Contains($field) -or $null -eq $attestation[$field] -or
+                ($attestation[$field] -is [string] -and [string]::IsNullOrWhiteSpace($attestation[$field]))) {
+                $problems += "record attestation is missing '$field'"
+            }
+        }
+        if ($attestation.Contains('evidence') -and $attestation['evidence'].Count -eq 0) {
+            $problems += 'record attestation evidence is empty'
+        }
+        if ($attestation.Contains('requiredGates') -and $attestation['requiredGates'] -and
+            $attestation.Contains('evidence') -and $attestation['evidence']) {
+            $requiredGates = $ExpectedGates
+            foreach ($key in $ExpectedGates.Keys) {
+                if ($attestation['requiredGates'][$key] -ne $ExpectedGates[$key]) { $problems += "attested requirement '$key' does not match the verified source overlay" }
+            }
+            $evidence = $attestation['evidence']
+            foreach ($name in $evidence.Keys) {
+                try {
+                    if ($evidence[$name]['resultSha256'] -isnot [string] -or $evidence[$name]['resultSha256'] -notmatch '^[a-f0-9]{64}$') { throw 'missing result-file hash' }
+                    if (($evidence[$name]['executed'] -isnot [int] -and $evidence[$name]['executed'] -isnot [long]) -or $evidence[$name]['executed'] -le 0) { throw 'invalid executed count' }
+                    if ($null -ne $evidence[$name]['score']) {
+                        $value = $evidence[$name]['score']
+                        if (($value -isnot [int] -and $value -isnot [double] -and $value -isnot [decimal]) -or
+                            -not [double]::IsFinite([double]$value) -or $value -lt 0 -or $value -gt 1) { throw 'invalid score' }
+                    }
+                    Assert-GateEnvelope -Envelope $evidence[$name]['envelope'] -Record $Record -Gate $name `
+                        -EnvironmentConfig @{ foundry = @{ projectEndpoint = $Record['projectEndpoint'] } }
+                    if ($evidence[$name]['executed'] -lt $evidence[$name]['envelope']['liveExecuted']) { throw 'live count exceeds executed count' }
+                    if ($name -ne 'smoke' -and $evidence[$name]['executed'] -ne $evidence[$name]['envelope']['liveExecuted']) { throw 'live count differs from total' }
+                }
+                catch { $problems += "invalid $name evidence: $($_.Exception.Message)" }
+            }
+            foreach ($gate in @(
+                    @{ Name = 'smoke'; Required = 'requireSmokeTestPass' },
+                    @{ Name = 'evaluation'; Required = 'requireEvaluationPass' },
+                    @{ Name = 'regression'; Required = 'requireRegressionPass' }
+                )) {
+                if (($requiredGates.Contains($gate.Required) -and $requiredGates[$gate.Required] -eq $true) -or
+                    ($gate.Name -eq 'evaluation' -and $null -ne $requiredGates['minimumEvaluationScore'])) {
+                    if (-not $Record['deployment'].Contains('gateResults') -or
+                        -not $Record['deployment']['gateResults'].Contains($gate.Name) -or
+                        $Record['deployment']['gateResults'][$gate.Name] -ne 'passed') {
+                        $actualResult = if ($Record['deployment'].Contains('gateResults') -and
+                            $Record['deployment']['gateResults'].Contains($gate.Name)) {
+                            [string]$Record['deployment']['gateResults'][$gate.Name]
+                        }
+                        else { 'missing' }
+                        $problems += "required $($gate.Name) gate result is '$actualResult', not 'passed'"
+                    }
+                    if (-not $evidence.Contains($gate.Name) -or -not $evidence[$gate.Name]) {
+                        $problems += "required $($gate.Name) gate has no attested evidence"
+                        continue
+                    }
+                    $gateEvidence = $evidence[$gate.Name]
+                    if ($gateEvidence['outcome'] -ne 'passed') {
+                        $problems += "required $($gate.Name) evidence outcome is '$($gateEvidence['outcome'])', not 'passed'"
+                    }
+                    if ([int]$gateEvidence['executed'] -le 0) {
+                        $problems += "required $($gate.Name) evidence executed no cases"
+                    }
+                    if ([string]::IsNullOrWhiteSpace([string]$gateEvidence['source'])) {
+                        $problems += "required $($gate.Name) evidence has no source"
+                    }
+                }
+            }
+            if ($requiredGates.Contains('minimumEvaluationScore') -and
+                $null -ne $requiredGates['minimumEvaluationScore'] -and
+                $evidence.Contains('evaluation') -and $evidence['evaluation']) {
+                if ($null -eq $evidence['evaluation']['score'] -or
+                    [double]$evidence['evaluation']['score'] -lt [double]$requiredGates['minimumEvaluationScore']) {
+                    $problems += "evaluation evidence does not meet minimum score $($requiredGates['minimumEvaluationScore'])"
+                }
+            }
         }
     }
 
@@ -2597,7 +2924,9 @@ function Get-LatestReleaseRecord {
 
     if ($EnvironmentConfig.Contains('releaseStore') -and $EnvironmentConfig['releaseStore'] -and $EnvironmentConfig['releaseStore']['type'] -eq 'azureBlob') {
         $store = $EnvironmentConfig['releaseStore']
-        $tempFile = Join-Path ([System.IO.Path]::GetTempPath()) ("release-$([Guid]::NewGuid().ToString('n')).json")
+        $scratch = Get-FoundryWorkRoot
+        New-Item -ItemType Directory -Force -Path $scratch | Out-Null
+        $tempFile = Join-Path $scratch ("release-$([Guid]::NewGuid().ToString('n')).json")
         $arguments = @(
             'storage', 'blob', 'download',
             '--account-name', $store['accountName'],
@@ -2628,7 +2957,161 @@ function Get-LatestReleaseRecord {
     return $null
 }
 
+function Get-ReleaseRecordById {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][ValidatePattern('^[a-zA-Z0-9_-]+$')][string]$ReleaseId,
+        [Parameter(Mandatory)][string]$AgentName,
+        [Parameter(Mandatory)][System.Collections.IDictionary]$EnvironmentConfig,
+        [Parameter(Mandatory)][string]$LocalDirectory
+    )
+    $path = Join-Path $LocalDirectory "$ReleaseId.json"
+    if (Test-Path -LiteralPath $path) { return Read-ReleaseRecordFile -Path $path }
+    if (-not $EnvironmentConfig['releaseStore'] -or $EnvironmentConfig['releaseStore']['type'] -ne 'azureBlob') { return $null }
+    $store = $EnvironmentConfig['releaseStore']
+    $scratch = Get-FoundryWorkRoot
+    New-Item -ItemType Directory -Force -Path $scratch | Out-Null
+    $download = Join-Path $scratch "$([Guid]::NewGuid().ToString('n')).json"
+    try {
+        $null = & az storage blob download --account-name $store['accountName'] --container-name $store['container'] `
+            --name "$AgentName/$($EnvironmentConfig['environment'])/$ReleaseId.json" --file $download --auth-mode login --only-show-errors 2>&1
+        if ($LASTEXITCODE -ne 0) { return $null }
+        return Read-ReleaseRecordFile -Path $download
+    }
+    finally { if (Test-Path -LiteralPath $download) { Remove-Item -LiteralPath $download -Force } }
+}
+
 #endregion
+
+function Invoke-FoundryPythonCli {
+    <#
+    .SYNOPSIS
+        Invokes the Python SDK bridge for Azure AI Foundry agent operations.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][ValidateSet('preflight', 'get-agent', 'create-version', 'promote-version', 'invoke-agent')][string]$Subcommand,
+        [Parameter(Mandatory)][System.Collections.IDictionary]$EnvironmentConfig,
+        [string]$LogicalName,
+        [string]$AgentVersion,
+        [AllowNull()][System.Collections.IDictionary]$InputObject,
+        [ValidateRange(1, 660)][int]$ProcessTimeoutSeconds = 180,
+        [switch]$DisableCreateRetries
+    )
+
+    $repoRoot = Get-RepositoryRoot
+    $cliPath = Join-Path $repoRoot (Join-Path 'scripts' (Join-Path 'python' 'foundry_agent_cli.py'))
+    if (-not (Test-Path -LiteralPath $cliPath)) {
+        throw [System.Management.Automation.RuntimeException]::new("Foundry SDK CLI not found at '$cliPath'.")
+    }
+
+    $pythonCommand = Get-Command python -ErrorAction SilentlyContinue
+    if (-not $pythonCommand) {
+        $pythonCommand = Get-Command python3 -ErrorAction SilentlyContinue
+    }
+    if (-not $pythonCommand) {
+        throw [System.Management.Automation.RuntimeException]::new("Python 3.10+ is required for Foundry agent deployment operations. Install Python and then run 'python -m pip install -r scripts/python/requirements.txt'.")
+    }
+
+    $pythonVersion = & $pythonCommand.Source -c "import sys; print(f'{sys.version_info[0]}.{sys.version_info[1]}')"
+    if ($LASTEXITCODE -ne 0) {
+        throw [System.Management.Automation.RuntimeException]::new("Unable to determine the Python version from '$($pythonCommand.Source)'.")
+    }
+    if ([version]$pythonVersion -lt [version]'3.10') {
+        throw [System.Management.Automation.RuntimeException]::new("Python 3.10+ is required for Foundry agent deployment operations. Found '$pythonVersion' at '$($pythonCommand.Source)'.")
+    }
+
+    $foundry = $EnvironmentConfig['foundry']
+    $tenantId = if ($EnvironmentConfig['azure'].Contains('tenantId')) { [string]$EnvironmentConfig['azure']['tenantId'] } else { $null }
+    $arguments = @(
+        $cliPath,
+        $Subcommand,
+        '--endpoint', [string]$foundry['projectEndpoint'],
+        '--api-version', [string]$foundry['apiVersion']
+    )
+    if ($LogicalName) {
+        $arguments += @('--agent-name', $LogicalName)
+    }
+    if ($AgentVersion) {
+        $arguments += @('--agent-version', $AgentVersion)
+    }
+    if ($tenantId) {
+        $arguments += @('--tenant-id', $tenantId)
+    }
+    if ($DisableCreateRetries) {
+        if ($Subcommand -ne 'create-version') { throw 'Create retry control only applies to create-version.' }
+        $arguments += '--disable-create-retries'
+    }
+
+    $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = $pythonCommand.Source
+    $startInfo.UseShellExecute = $false
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    $startInfo.RedirectStandardInput = $PSBoundParameters.ContainsKey('InputObject') -and $null -ne $InputObject
+    foreach ($argument in $arguments) {
+        [void]$startInfo.ArgumentList.Add($argument)
+    }
+
+    $process = [System.Diagnostics.Process]::new()
+    $process.StartInfo = $startInfo
+    if (-not $process.Start()) {
+        throw [System.Management.Automation.RuntimeException]::new("Failed to start the Foundry SDK CLI with '$($pythonCommand.Source)'.")
+    }
+
+    if ($startInfo.RedirectStandardInput) {
+        $jsonInput = $InputObject | ConvertTo-Json -Depth 64 -Compress
+        $process.StandardInput.Write($jsonInput)
+        $process.StandardInput.Close()
+    }
+
+    $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+    $stderrTask = $process.StandardError.ReadToEndAsync()
+    if (-not $process.WaitForExit($ProcessTimeoutSeconds * 1000)) {
+        $process.Kill($true)
+        $process.WaitForExit()
+        $process.Dispose()
+        throw "Foundry SDK CLI '$Subcommand' exceeded its bounded process timeout."
+    }
+    $stdout = $stdoutTask.GetAwaiter().GetResult()
+    $stderr = $stderrTask.GetAwaiter().GetResult()
+
+    if (-not [string]::IsNullOrWhiteSpace($stderr) -and $process.ExitCode -eq 0) {
+        foreach ($line in ($stderr -split "(`r`n|`n|`r)")) {
+            if ([string]::IsNullOrWhiteSpace($line)) { continue }
+            Write-Warning $line.Trim()
+        }
+    }
+
+    if ($process.ExitCode -ne 0) {
+        $detail = $stderr.Trim()
+        if ([string]::IsNullOrWhiteSpace($detail)) { $detail = $stdout.Trim() }
+        if (-not [string]::IsNullOrWhiteSpace($detail)) {
+            $detailLines = @($detail -split "(`r`n|`n|`r)" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+            $detailToParse = if ($detailLines.Count -gt 0) { $detailLines[-1] } else { $detail }
+            try {
+                $errorPayload = $detailToParse | ConvertFrom-Json -Depth 16
+                if ($errorPayload.PSObject.Properties.Name -contains 'error' -and $errorPayload.error) {
+                    $detail = [string]$errorPayload.error
+                }
+            }
+            catch {
+            }
+        }
+        if ([string]::IsNullOrWhiteSpace($detail)) {
+            $detail = "The Python helper exited with code $($process.ExitCode)."
+        }
+        throw [System.Management.Automation.RuntimeException]::new("Foundry SDK CLI '$Subcommand' failed: $detail Install or refresh the pinned SDK dependencies with 'python -m pip install -r scripts/python/requirements.txt'.")
+    }
+
+    if ([string]::IsNullOrWhiteSpace($stdout)) { return $null }
+    try {
+        return $stdout | ConvertFrom-Json -Depth 64
+    }
+    catch [System.ArgumentException] {
+        throw [System.Management.Automation.RuntimeException]::new("Foundry SDK CLI '$Subcommand' returned invalid JSON. Raw output: $stdout")
+    }
+}
 
 Export-ModuleMember -Function @(
     'Test-PathSegmentSafe',
@@ -2653,6 +3136,7 @@ Export-ModuleMember -Function @(
     'Write-OpsLog',
     'Write-CiSummary',
     'Get-RepositoryRoot',
+    'Get-FoundryWorkRoot',
     'Resolve-RequiredPath',
     'ConvertTo-OrderedHashtable',
     'Read-JsonFile',
@@ -2680,6 +3164,10 @@ Export-ModuleMember -Function @(
     'Invoke-FoundryApi',
     'Test-FoundryEndpoint',
     'Get-FoundryAgent',
+    'Get-FoundryReleaseTarget',
+    'Get-ReleaseRecordById',
+    'New-FoundryAgentVersion',
+    'Set-FoundryAgentActiveVersion',
     'Invoke-FoundryAgentRun',
     'Resolve-SecretReference',
     'New-ReleaseRecord',

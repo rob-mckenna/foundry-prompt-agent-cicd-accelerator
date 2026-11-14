@@ -29,16 +29,36 @@ on:
         type: string
         required: true
         default: samples/simple-agent
+      qualificationMode:
+        description: Enter the separately reviewed, manually approved DEV qualification path.
+        type: boolean
+        default: false
+      qualificationPhase:
+        description: Separate ordered phase; proof logs must be inspected before approving the next phase.
+        type: choice
+        options: [PrivacyProof, Preflight, Experiment]
+        default: PrivacyProof
+      expectedCommit:
+        description: Full reviewed SHA (required in qualification mode).
+        type: string
+      privacyProofRunId:
+        description: Reviewed successful PrivacyProof run at the same SHA.
+        type: string
+      preflightRunId:
+        description: Reviewed successful Preflight run at the same SHA.
+        type: string
 
 permissions:
   contents: read
+  id-token: write
 
 concurrency:
-  group: deploy-dev-${{ inputs.agentPath || 'samples/simple-agent' }}
+  group: ${{ inputs.qualificationMode == true && 'dev-qualification-exclusive' || format('deploy-dev-{0}', inputs.agentPath || 'samples/simple-agent') }}
   cancel-in-progress: false
 
 jobs:
   validate:
+    if: ${{ inputs.qualificationMode != true }}
     name: Validate
     uses: ./.github/workflows/_reusable-validate.yml
     with:
@@ -46,6 +66,7 @@ jobs:
       installPester: true
 
   package:
+    if: ${{ inputs.qualificationMode != true }}
     name: Package
     needs: validate
     uses: ./.github/workflows/_reusable-package.yml
@@ -55,6 +76,7 @@ jobs:
       retentionDays: 90
 
   deploy:
+    if: ${{ inputs.qualificationMode != true }}
     name: Deploy to DEV
     needs: package
     uses: ./.github/workflows/_reusable-deploy.yml
@@ -71,6 +93,7 @@ jobs:
       validateSecretReferences: false
 
   summary:
+    if: ${{ inputs.qualificationMode != true }}
     name: Record package identity
     needs: [package, deploy]
     runs-on: ubuntu-latest
@@ -90,3 +113,188 @@ jobs:
             echo ""
             echo "Promote this exact package with the deploy-test workflow. Do not rebuild."
           } >> "$GITHUB_STEP_SUMMARY"
+
+  qualification:
+    name: Bounded DEV qualification
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.qualificationMode == true }}
+    environment: dev
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      QUAL_PHASE: ${{ inputs.qualificationPhase }}
+      QUAL_EXPECTED_COMMIT: ${{ inputs.expectedCommit }}
+      QUAL_PRIVACY_PROOF_RUN_ID: ${{ inputs.privacyProofRunId }}
+      QUAL_PREFLIGHT_RUN_ID: ${{ inputs.preflightRunId }}
+      QUAL_WORKFLOW_SHA: ${{ github.workflow_sha }}
+    steps:
+      - name: Check frozen dispatch source before checkout
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:GITHUB_EVENT_NAME -cne 'workflow_dispatch' -or
+              $env:GITHUB_REF -cne 'refs/heads/squad/sdk-first-qualification' -or
+              $env:GITHUB_RUN_ATTEMPT -cne '1' -or
+              $env:QUAL_EXPECTED_COMMIT -cnotmatch '^[a-f0-9]{40}$' -or
+              $env:GITHUB_SHA -cne $env:QUAL_EXPECTED_COMMIT -or
+              $env:QUAL_WORKFLOW_SHA -cne $env:QUAL_EXPECTED_COMMIT -or
+              $env:QUAL_PHASE -cnotin @('PrivacyProof','Preflight','Experiment') -or
+              $env:ACTIONS_STEP_DEBUG -eq 'true' -or $env:ACTIONS_RUNNER_DEBUG -eq 'true' -or $env:RUNNER_DEBUG -eq '1') {
+            Write-Output 'QUAL_SOURCE_BLOCKED'; exit 2
+          }
+      - name: Checkout reviewed source only
+        shell: pwsh
+        env:
+          GIT_CONFIG_NOSYSTEM: '1'
+          GIT_CONFIG_GLOBAL: /dev/null
+          GIT_TERMINAL_PROMPT: '0'
+        run: |
+          # Public-source qualification only: no checkout token or persisted Git credentials.
+          try {
+            if ($env:GITHUB_SERVER_URL -cne 'https://github.com' -or
+                $env:GITHUB_REPOSITORY -cnotmatch '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$' -or
+                (Test-Path -LiteralPath .git)) { throw 'blocked' }
+            git init --quiet
+            if ($LASTEXITCODE -ne 0) { throw 'blocked' }
+            git remote add origin "$env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY"
+            if ($LASTEXITCODE -ne 0) { throw 'blocked' }
+            git -c credential.helper= -c core.askPass= -c http.extraHeader= fetch --quiet --no-tags --depth=1 origin $env:QUAL_EXPECTED_COMMIT
+            if ($LASTEXITCODE -ne 0) { throw 'blocked' }
+            git checkout --quiet --detach $env:QUAL_EXPECTED_COMMIT
+            if ($LASTEXITCODE -ne 0) { throw 'blocked' }
+          } catch { Write-Output 'QUAL_SOURCE_BLOCKED'; exit 2 }
+      - name: Verify checkout and ordered proof references
+        shell: pwsh
+        run: |
+          try {
+            . ./scripts/Invoke-DevQualification.ps1
+            $head = (git rev-parse HEAD).Trim()
+            Assert-QualificationDispatch -Event $env:GITHUB_EVENT_NAME -Ref $env:GITHUB_REF `
+              -Attempt $env:GITHUB_RUN_ATTEMPT -Sha $env:GITHUB_SHA -WorkflowSha $env:QUAL_WORKFLOW_SHA `
+              -Head $head -RunId $env:GITHUB_RUN_ID -ExpectedCommit $env:QUAL_EXPECTED_COMMIT `
+              -Phase $env:QUAL_PHASE -PrivacyProofRunId $env:QUAL_PRIVACY_PROOF_RUN_ID -PreflightRunId $env:QUAL_PREFLIGHT_RUN_ID
+            git diff --quiet HEAD --
+            if ($LASTEXITCODE -ne 0) { throw 'QUAL_SOURCE_BLOCKED' }
+          } catch { Write-Output 'QUAL_SOURCE_BLOCKED'; exit 2 }
+      - name: Bootstrap inert privacy proof only
+        if: ${{ inputs.qualificationPhase == 'PrivacyProof' }}
+        shell: pwsh
+        env:
+          BOOT_SENTINEL: ${{ secrets.QUAL_PRIVACY_SENTINEL }}
+        run: |
+          try {
+            . ./scripts/Invoke-DevQualification.ps1
+            $values = New-QualificationSentinels -Seed $env:BOOT_SENTINEL
+            Initialize-QualificationEnvironment -Values $values -EnvironmentFile $env:GITHUB_ENV
+            Remove-Item Env:BOOT_SENTINEL
+          } catch { Write-Output 'QUAL_CONFIG_BLOCKED'; exit 2 }
+      - name: Bootstrap approved confidential metadata
+        if: ${{ inputs.qualificationPhase != 'PrivacyProof' }}
+        shell: pwsh
+        env:
+          BOOT_AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          BOOT_AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          BOOT_AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          BOOT_QUAL_FOUNDRY_RESOURCE_GROUP: ${{ secrets.QUAL_FOUNDRY_RESOURCE_GROUP }}
+          BOOT_QUAL_FOUNDRY_ACCOUNT: ${{ secrets.QUAL_FOUNDRY_ACCOUNT }}
+          BOOT_QUAL_FOUNDRY_PROJECT: ${{ secrets.QUAL_FOUNDRY_PROJECT }}
+          BOOT_QUAL_PROJECT_ENDPOINT: ${{ secrets.QUAL_PROJECT_ENDPOINT }}
+          BOOT_QUAL_MODEL_DEPLOYMENT: ${{ secrets.QUAL_MODEL_DEPLOYMENT }}
+          BOOT_QUAL_STORAGE_ACCOUNT: ${{ secrets.QUAL_STORAGE_ACCOUNT }}
+          BOOT_QUAL_PACKAGE_CONTAINER: ${{ secrets.QUAL_PACKAGE_CONTAINER }}
+          BOOT_QUAL_RELEASE_CONTAINER: ${{ secrets.QUAL_RELEASE_CONTAINER }}
+          BOOT_QUAL_EXPERIMENT_ID: ${{ secrets.QUAL_EXPERIMENT_ID }}
+          BOOT_QUAL_AGENT_NAME: ${{ secrets.QUAL_AGENT_NAME }}
+        run: |
+          try {
+            . ./scripts/Invoke-DevQualification.ps1
+            $values = [ordered]@{}
+            foreach ($key in (Get-QualificationKeyPatterns).Keys) {
+              $values[$key] = [Environment]::GetEnvironmentVariable("BOOT_$key")
+            }
+            Initialize-QualificationEnvironment -Values $values -EnvironmentFile $env:GITHUB_ENV
+          } catch { Write-Output 'QUAL_CONFIG_BLOCKED'; exit 2 }
+      - name: Confine private runner scratch
+        shell: pwsh
+        run: |
+          try {
+            . ./scripts/Invoke-DevQualification.ps1
+            $private = Resolve-QualificationPrivateRoot -Repository $env:GITHUB_WORKSPACE `
+              -Path (Join-Path $env:GITHUB_WORKSPACE "out/qualification/bootstrap-$env:GITHUB_RUN_ID")
+            $null = New-Item -ItemType Directory -Path $private
+            chmod 700 $private
+            if ($LASTEXITCODE -ne 0) { throw 'blocked' }
+            foreach ($key in @('TEMP','TMP','TMPDIR')) {
+              Add-Content -LiteralPath $env:GITHUB_ENV -Value "$key=$private"
+            }
+            if ($env:QUAL_PHASE -cne 'PrivacyProof') {
+              Initialize-QualificationAuthDirectory -Repository $env:GITHUB_WORKSPACE `
+                -RunId $env:GITHUB_RUN_ID -EnvironmentFile $env:GITHUB_ENV
+            }
+          } catch { Write-Output 'QUAL_PATH_BLOCKED'; exit 2 }
+      - name: Exercise already masked inert normal channels
+        if: ${{ inputs.qualificationPhase == 'PrivacyProof' }}
+        shell: pwsh
+        run: |
+          . ./scripts/Invoke-DevQualification.ps1
+          foreach ($key in (Get-QualificationKeyPatterns).Keys) {
+            $value = [Environment]::GetEnvironmentVariable($key)
+            Write-Host "QUAL_MASK_PROBE $value"
+            Write-Warning "QUAL_MASK_PROBE $value"
+          }
+          # Annotations and summaries contain constant verdicts, never canaries.
+          Write-Host '::notice::QUAL_PRIVACY_CHANNELS_EXERCISED'
+      - name: Set up selected Python for real read-only or experiment phase
+        if: ${{ inputs.qualificationPhase != 'PrivacyProof' }}
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.11'
+      - name: Install pinned qualification SDK dependencies
+        if: ${{ inputs.qualificationPhase != 'PrivacyProof' }}
+        shell: pwsh
+        run: |
+          python -m pip install --disable-pip-version-check --no-cache-dir -r scripts/python/requirements.txt
+          if ($LASTEXITCODE -ne 0) { Write-Output 'QUAL_DEPENDENCY_BLOCKED'; exit 2 }
+      - name: Authenticate OIDC without credential process arguments
+        if: ${{ inputs.qualificationPhase != 'PrivacyProof' }}
+        shell: pwsh
+        run: |
+          # No JWT in OS argv; CLI/MSAL can persist it in the transient credential directory.
+          try {
+            . ./scripts/Invoke-DevQualification.ps1
+            Assert-QualificationAuthDirectory -Repository $env:GITHUB_WORKSPACE -RunId $env:GITHUB_RUN_ID
+            $env:TEMP = $env:AZURE_CONFIG_DIR; $env:TMP = $env:AZURE_CONFIG_DIR; $env:TMPDIR = $env:AZURE_CONFIG_DIR
+            $az = (Get-Command az -ErrorAction Stop).Source
+            if ((Get-Content -LiteralPath $az -TotalCount 1) -cne '#!/opt/az/bin/python3') { throw 'blocked' }
+            & /opt/az/bin/python3 ./scripts/python/foundry_agent_cli.py qualification-login `
+              *> (Join-Path $env:AZURE_CONFIG_DIR 'private-login.log')
+            if ($LASTEXITCODE -ne 0) { throw 'blocked' }
+          } catch { Write-Output 'QUAL_IDENTITY_BLOCKED'; exit 2 }
+      - name: Execute only the selected bounded phase
+        shell: pwsh
+        run: |
+          ./scripts/Invoke-DevQualification.ps1 -Phase $env:QUAL_PHASE -ExpectedCommit $env:QUAL_EXPECTED_COMMIT `
+            -PrivacyProofRunId $env:QUAL_PRIVACY_PROOF_RUN_ID -PreflightRunId $env:QUAL_PREFLIGHT_RUN_ID
+          exit $LASTEXITCODE
+      - name: Constant final privacy verdict
+        if: ${{ always() && inputs.qualificationPhase == 'PrivacyProof' }}
+        shell: pwsh
+        run: |
+          Write-Output 'QUAL_PRIVACY_FINALIZER_COMPLETE_REVIEW_ALL_AVAILABLE_LOGS'
+      - name: Remove only this job's transient CLI credentials after all consumers
+        if: ${{ always() && inputs.qualificationPhase != 'PrivacyProof' }}
+        shell: pwsh
+        run: |
+          try {
+            if (-not (Test-Path -LiteralPath ./scripts/Invoke-DevQualification.ps1)) {
+              if ($env:QUAL_AUTH_DIRECTORY) { throw 'blocked' }
+              Write-Output 'QUAL_AUTH_NOT_CREATED'; exit 0
+            }
+            . ./scripts/Invoke-DevQualification.ps1
+            $receipt = Clear-QualificationAuthDirectory -Repository $env:GITHUB_WORKSPACE -RunId $env:GITHUB_RUN_ID
+            if (-not $receipt.verified) { throw 'blocked' }
+            if ($receipt.disposition -ceq 'not-created') { Write-Output 'QUAL_AUTH_NOT_CREATED' }
+            else { Write-Output 'QUAL_AUTH_REMOVED_VERIFIED' }
+          } catch { Write-Output 'QUAL_AUTH_CLEANUP_FAILED'; exit 1 }

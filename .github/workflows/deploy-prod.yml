@@ -34,6 +34,10 @@ on:
         description: Approved change record id. Recorded in agent metadata and in the release record.
         type: string
         required: true
+      businessSignoffId:
+        description: UAT business acceptance reference (BSO- followed by 4-10 digits). Recorded in the release record.
+        type: string
+        required: true
       evaluationSuitePath:
         description: Evaluation suite to run after deployment. Leave empty to skip.
         type: string
@@ -47,6 +51,7 @@ on:
 permissions:
   contents: read
   actions: read
+  id-token: write
 
 concurrency:
   group: deploy-prod-${{ inputs.agentName }}
@@ -76,6 +81,14 @@ jobs:
             exit 1
           fi
 
+      - name: Require durable business sign-off
+        shell: bash
+        run: |
+          if [[ ! "${{ inputs.businessSignoffId }}" =~ ^BSO-[0-9]{4,10}$ ]]; then
+            echo "::error::businessSignoffId '${{ inputs.businessSignoffId }}' is invalid (expected for example BSO-0043912)."
+            exit 1
+          fi
+
       - name: Check out repository
         uses: actions/checkout@v4
 
@@ -87,15 +100,26 @@ jobs:
           run-id: ${{ inputs.sourceRunId }}
           github-token: ${{ github.token }}
 
+      - name: Download the attested UAT release record
+        uses: actions/download-artifact@v4
+        with:
+          name: release-uat-${{ inputs.sourceRunId }}
+          path: artifacts/source-release
+          run-id: ${{ inputs.sourceRunId }}
+          github-token: ${{ github.token }}
+
       - name: Verify the package for production
         id: inspect
         shell: pwsh
         run: |
           Set-StrictMode -Version 3.0
           $ErrorActionPreference = 'Stop'
-          $package = Get-ChildItem ./artifacts -Filter '*.zip' -Recurse | Select-Object -First 1
+          $packages = @(Get-ChildItem ./artifacts -Filter '*.zip' -File)
+          if ($packages.Count -ne 1) { throw 'Expected exactly one unchanged package at the artifact root.' }
+          $package = $packages[0]
           if (-not $package) { throw "Run ${{ inputs.sourceRunId }} produced no promoted package artifact." }
-          $result = ./scripts/Test-AgentPackage.ps1 -PackagePath $package.FullName -Environment prod
+          $result = ./scripts/Test-AgentPackage.ps1 -PackagePath $package.FullName -Environment prod -SkipGovernance
+          # Runtime governance with the approved change reference is mandatory in import-agent before mutation.
           if ($result.AgentName -ne '${{ inputs.agentName }}') {
             throw "Artifact holds agent '$($result.AgentName)' but '${{ inputs.agentName }}' was requested."
           }
@@ -107,7 +131,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: production-package
-          path: artifacts/*.zip
+          path: artifacts/
           if-no-files-found: error
           retention-days: 365
 
@@ -123,6 +147,7 @@ jobs:
             echo "| Version | \`${{ steps.inspect.outputs.agentVersion }}\` |"
             echo "| Package id | \`${{ steps.inspect.outputs.packageId }}\` |"
             echo "| Change record | \`${{ inputs.changeRecordId }}\` |"
+            echo "| Business sign-off | \`${{ inputs.businessSignoffId }}\` |"
             echo "| Source run | [${{ inputs.sourceRunId }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ inputs.sourceRunId }}) |"
             echo "| Requested by | ${{ github.actor }} |"
             echo ""
@@ -147,3 +172,4 @@ jobs:
       runRegression: true
       validateSecretReferences: true
       changeRecordId: ${{ inputs.changeRecordId }}
+      businessSignoffId: ${{ inputs.businessSignoffId }}

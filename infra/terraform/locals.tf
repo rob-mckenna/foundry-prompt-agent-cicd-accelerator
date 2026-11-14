@@ -17,13 +17,13 @@ locals {
     managedBy   = "foundry-prompt-agent-cicd-accelerator"
   }, var.tags)
 
-  # Built-in role definition names used with azurerm_role_assignment.
+  # Built-in role names and scoped IDs used with azurerm_role_assignment.
   roles = {
     key_vault_secrets_user         = "Key Vault Secrets User"
     storage_blob_data_contributor  = "Storage Blob Data Contributor"
     storage_queue_data_contributor = "Storage Queue Data Contributor"
     search_index_data_reader       = "Search Index Data Reader"
-    azure_ai_user                  = "Azure AI User"
+    azure_ai_user                  = "/subscriptions/${data.azurerm_client_config.current.subscription_id}/providers/Microsoft.Authorization/roleDefinitions/53ca6127-db72-4b80-b1b0-d745d6d5456d"
   }
 
   release_containers = ["agent-releases", "agent-packages"]

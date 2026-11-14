@@ -68,7 +68,7 @@
           "required": ["type"],
           "additionalProperties": false,
           "properties": {
-            "type": { "enum": ["auto", "text", "json_object", "json_schema"] },
+            "type": { "enum": ["text", "json_object", "json_schema"] },
             "jsonSchemaFile": { "type": "string", "description": "Repository-relative path to the JSON schema used when type is json_schema." }
           }
         }

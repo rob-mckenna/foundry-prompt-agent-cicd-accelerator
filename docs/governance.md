@@ -2,6 +2,8 @@
 
 Governance here means four things you must be able to evidence: **who approved a change**, **what exactly is
 running**, **what the agent is allowed to do**, and **how you would undo it**.
+This community reference provides source-level controls, not security approval, Microsoft product support,
+or an Azure-qualified operational result. Qualify deployment, live inference and verified recovery separately.
 
 ## Control map
 
@@ -23,7 +25,7 @@ flowchart TB
         D5["Diagnostic settings to Log Analytics"]
     end
     subgraph RESPOND["Responsive - undo the change"]
-        R1["Automatic rollback on gate failure"]
+        R1["One verified rollback attempt<br/>when prior evidence is retained"]
         R2["Manual rollback workflow"]
         R3["Release records naming the previous package"]
     end
@@ -46,6 +48,10 @@ These are not guidance. They fail a build or a deployment.
 | Required metadata keys present | `Test-AgentGovernance` | Deployment fails |
 | Temperature within the environment cap | `Test-AgentGovernance` | Deployment fails |
 | Package integrity and content address | `Test-AgentPackage.ps1`, `Expand-AgentPackage` | Deployment fails |
+| Descriptor-bound `/2` identity; strict `/1` verification | `Get-PackageId`, package builder/verifier | Stable descriptor/content tampering changes identity; malformed/unknown formats fail |
+| Only an attested `succeeded` release can be promoted | `Complete-Release.ps1`, `promote-agent.ps1` | Promotion fails |
+| Exact release-bound live evidence and verified active routing | Shared target/evidence helpers, `Complete-Release.ps1` | Stale, unbound, offline, skipped or inconsistent evidence fails attestation |
+| Rollback requires prior package plus attested release JSON and new live gates | `Invoke-Rollback.ps1` | Missing evidence, unrelated serving drift or failed verification stops recovery |
 | Promotion uses the artifact recorded for the source environment | `promote-agent.ps1` | Promotion fails |
 | Promotion order and no skipping | `promote-agent.ps1` | Promotion fails without an explicit justification |
 | Change record format in production | `deploy-prod.yml` preflight | Run fails before approval is requested |
@@ -97,6 +103,7 @@ Approvals live on the platform, not in YAML, so a pull request to this repositor
 Production additionally requires, before approval is even requested:
 
 - a change record id matching `^[A-Za-z]{2,5}-[0-9]{4,10}$`;
+- a durable UAT business sign-off id matching `^BSO-[0-9]{4,10}$`;
 - the agent name typed again as a confirmation;
 - a verified artifact whose content address matches the one recorded for UAT.
 
@@ -109,18 +116,60 @@ For any deployment, the release record answers every audit question:
 
 | Question | Field |
 | --- | --- |
-| What was deployed? | `packageId`, `agent.name`, `agent.version` |
-| Where? | `environment`, `agent.remoteAgentId` |
+| What was deployed? | `packageId`, `agent.name`, `agent.version` (manifest semver), `agent.serviceVersion`, `agent.serviceVersionId` (opaque SDK identity) |
+| Where? | `environment`, `projectEndpoint`, `agent.remoteAgentId` (logical resource, not assistant id) |
 | When? | `deployment.deployedAtUtc` |
 | Who? | `deployment.deployedBy`, `deployment.pipelineRunUrl` |
 | Was it a promotion? | `deployment.operation`, `deployment.sourceEnvironment` |
 | Which gates passed? | `deployment.gateResults` |
-| What did it replace? | `previous.packageId`, `previous.agentVersion`, `previous.releaseId` |
-| Who approved it? | The run's approval history plus `deployment.approvals` |
+| Which attempt and live target did the evidence measure? | `deployment.attestation.evidence.<gate>.envelope`, `resultSha256`; retained result details include completed Response IDs |
+| Was runtime mutation verified? | `deployment.runtimeMutation` including started/completed stages, timestamps and candidate version |
+| Was the release fully attested? | `deployment.outcome`, `deployment.attestation.gatesSatisfied`, `deployment.attestation.attestedBy` |
+| Which governance decisions authorized it? | `governance.changeRecordId`, `governance.businessSignoffId`, `governance.responsibleAiReviewId` |
+| Why and under which original change was it rolled back? | `governance.rollbackReason`, `governance.originalChangeRecordId` |
+| What did it replace? | `previous.packageId`, `previous.agentVersion`, `previous.releaseId`, `previous.serviceVersion`, `previous.serviceVersionId` |
+| Who approved it? | The GitHub/Azure DevOps environment approval history linked by `deployment.pipelineRunUrl`; the current scripts do not populate `deployment.approvals` |
 
 Records are written to blob storage as `<agent>/<environment>/<releaseId>.json` with a `latest.json` pointer,
 and retained as pipeline artifacts for a year. Enable blob versioning and a lifecycle policy that meets your
 retention obligation; the IaC enables versioning already.
+`latest.json` is the latest audit attempt, not a trusted active/known-good pointer. Reconcile the pinned
+serving service version to an attested record and retain both its package and JSON before mutation.
+
+Deployments and promotions write the initial record as `pending-verification`. `scripts/Complete-Release.ps1`
+is the gate attestation step that attaches the smoke/evaluation/regression evidence and moves the outcome to
+`succeeded` or `failed`; `promote-agent.ps1` refuses to advance anything else. A successful attestation must
+contain completed mutation and non-empty, passing **live** evidence and a passing `deployment.gateResults`
+entry for every required gate. A failed attestation may have empty evidence when a required test never produced
+a result; the failed gate result,
+attester and required-gate declaration remain durable. Rollback records require a non-empty
+`governance.rollbackReason`.
+
+New records/evidence use `schemaVersion: 1.1.0`. Legacy `1.0.0` records remain readable for audit, not a
+waiver of service identity or live evidence requirements. Runners receive the deployment result's exact
+`-ReleaseRecordPath`; evidence binds release/package/agent/environment/normalized project endpoint, manifest
+semver and service version, with execution after verified activation and no future timestamps.
+Required smoke includes a successful live canary; evaluation/regression execute all counted cases live and
+include completed Responses IDs. Scores, totals and threshold verdicts are validated, including any packaged
+minimum evaluation score even when its boolean gate is false. Fixtures, skipped/configuration-only smoke,
+baseline updates and unbound legacy results cannot authorize these gates. Invalid supplied optional evidence
+also fails. Attestation retains the identity envelope and result-file SHA-256; this binds bytes, not a
+service signature or protection from a malicious pipeline.
+
+The managed endpoint must be enabled for Responses with exactly one fixed concrete version at 100%;
+latest/dynamic, split and unknown selectors fail closed. Latest and active are separate identities.
+Activation is verified by readback, and shared SDK runtime checks the selector before and after each call.
+Deploy, test and rollback require a common agent/environment lock; Azure DevOps' exclusive-lock check is
+external configuration. Out-of-band concurrent edits are unsupported and transient edits may escape
+before/after observation.
+
+Mutation-started evidence is persisted before SDK creation, including ambiguous creation failures.
+First creation can affect traffic before explicit pinning and gates; this is not transactional or
+zero-exposure deployment. Recovery requires the retained known-good package **and** attested release JSON,
+rejects unrelated serving drift, creates a new service version and re-runs the target overlay's gates.
+Only a newly attested `operation=rollback`, `outcome=succeeded` is verified recovery; the failed forward job
+still fails. No prior artifact on first deployment means explicit manual recovery, not invented rollback.
+Same-archive promotion and rollback do not freeze external model, knowledge, connection or secret state.
 
 ## Responsible AI
 
@@ -142,9 +191,10 @@ reach UAT or production without someone having recorded a review reference, and 
 package and the audit record.
 
 Content safety filters are a property of the model deployment, not the agent. The IaC sets
-`raiPolicyName: 'Microsoft.DefaultV2'` on every deployment and `versionUpgradeOption: NoAutoUpgrade` so the
-model version cannot change under a promoted package. Replace the policy name with your organisation's custom
-policy.
+`raiPolicyName: 'Microsoft.DefaultV2'` on every deployment and `versionUpgradeOption: NoAutoUpgrade` to avoid
+automatic model upgrades. These settings are outside the agent package and do not prevent authorized
+out-of-band changes or make environments behave identically. Replace the policy name with your organisation's
+custom policy.
 
 ### Agent-specific risks
 
@@ -156,7 +206,7 @@ policy.
 | Configuration or instruction disclosure | Smoke and regression probes on every deployment | Keep the probes current as instructions change |
 | Over-broad agent permissions | The project managed identity gets reader-level data roles only | Do not grant it write roles on systems of record |
 | Silent capability change | Tool count is asserted by the smoke test against the resolved package | Pass `-ExpectedToolCount` in your pipeline |
-| Untracked agents created in the portal | `managed_by` metadata plus the drift procedure | Remove human write access to production |
+| Untracked agents created in the portal | Scheduled best-effort export and comparison using version metadata such as `managed_by` | Remove human write access to production |
 
 ## Cost governance
 
@@ -179,8 +229,9 @@ Before the first production deployment:
 
 - [ ] `CODEOWNERS` lists real teams and branch protection requires code owner review.
 - [ ] Federated credential subjects are scoped to the specific repository and environment.
-- [ ] The deployment identity holds only Azure AI User, Key Vault Secrets User and Storage Blob Data
-      Contributor.
+- [ ] The deployment identity's Foundry User, Key Vault Secrets User and Storage Blob Data Contributor
+      assignments have been reviewed at the intended scopes for the operations in use. Additional permissions
+      require separate approval; [Foundry User does not grant agent application publishing](architecture.md#identity-and-trust).
 - [ ] Humans do not hold write access to the production project.
 - [ ] `governance.allowedToolTypes` for production has been reviewed by security.
 - [ ] Every agent has an owner, a contact, a classification and a Responsible AI review id.
@@ -188,5 +239,8 @@ Before the first production deployment:
 - [ ] Release store retention meets your audit obligation, and artifact retention exceeds your rollback
       horizon.
 - [ ] A rollback has been rehearsed end to end in TEST.
+- [ ] SDK preflight, pinned routing, Conversations/Responses and release-bound gates have been qualified
+      against the target service; offline tests are not substituted for that rehearsal.
+- [ ] Deployment, testing and rollback share one lock; prior packages and their attested release JSON are retained.
 - [ ] The drift check is scheduled against UAT and PROD.
 - [ ] Secret scanning with push protection is enabled on the repository.

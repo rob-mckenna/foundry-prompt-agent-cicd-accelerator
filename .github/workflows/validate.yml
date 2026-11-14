@@ -44,7 +44,7 @@ jobs:
           Set-StrictMode -Version 3.0
           $ErrorActionPreference = 'Stop'
           $result = ./scripts/New-AgentPackage.ps1 -AgentPath ./samples/${{ matrix.sample }} -OutputDirectory ./out -SourceCommit $env:GITHUB_SHA
-          ./scripts/Test-AgentPackage.ps1 -PackagePath $result.PackagePath
+          ./scripts/Test-AgentPackage.ps1 -PackagePath $result.PackagePath -Environment dev
 
       - name: Confirm the build is reproducible
         shell: pwsh
@@ -75,6 +75,11 @@ jobs:
           # -WhatIf returns before any credential is requested, so this stays credential free.
           foreach ($environment in @('dev', 'test', 'uat', 'prod')) {
             Write-Host "::group::${{ matrix.sample }} -> $environment"
-            ./scripts/import-agent.ps1 -PackagePath (Get-ChildItem ./out/*.zip | Select-Object -First 1).FullName -Environment $environment -WhatIf
+            $syntheticGovernance = @{}
+            if ($environment -eq 'prod') {
+              # Synthetic format-only references for offline WhatIf, NOT approvals or live gate evidence.
+              $syntheticGovernance = @{ ChangeRecordId = 'CHG-9000000001'; BusinessSignoffId = 'BSO-9000000001' }
+            }
+            ./scripts/import-agent.ps1 -PackagePath (Get-ChildItem ./out/*.zip | Select-Object -First 1).FullName -Environment $environment @syntheticGovernance -WhatIf
             Write-Host '::endgroup::'
           }

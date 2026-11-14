@@ -111,8 +111,10 @@ az account show --query '{name:name, user:user.name}'    # confirm which identit
 az role assignment list --assignee <principalId> --all --output table
 ```
 
-The deployment identity needs **Azure AI User** on the Foundry account or project. Role assignments can take
-several minutes to propagate.
+For agent authoring/data-plane operations, the deployment identity needs **Foundry User** (formerly Azure AI
+User; role ID `53ca6127-db72-4b80-b1b0-d745d6d5456d`) on the intended Foundry account or project scope.
+Review [permissions and inherited scope](architecture.md#identity-and-trust); this is not a read-only role
+or a grant for every operation. Role assignments can take several minutes to propagate.
 
 If the agent deploys but cannot retrieve anything, you are looking at the wrong identity. The **project**
 managed identity, not the deployment identity, reads your knowledge sources at run time. See
@@ -360,15 +362,19 @@ az bicep build-params --file infra/bicep/parameters/prod.bicepparam --stdout
 
 ## TS-18 GitHub Actions: `AADSTS70021: No matching federated identity record found`
 
-**Cause.** The federated credential subject does not match the token the workflow requested.
+**Cause.** The federated credential does not match the token the workflow requested.
 
-**Fix.** The subject must match exactly:
+**Fix.** Issuer, subject and audience must match case-sensitively. These are default-format subject
+examples, not universal required strings; a customized subject must match its complete configured format:
 
-| Workflow context | Required subject |
-| --- | --- |
-| Job with `environment: prod` | `repo:<owner>/<repo>:environment:prod` |
-| Job on a branch, no environment | `repo:<owner>/<repo>:ref:refs/heads/main` |
-| Job on a tag | `repo:<owner>/<repo>:ref:refs/tags/v1.2.3` |
+| Workflow context | Immutable-ID subject | Legacy name-only subject |
+| --- | --- | --- |
+| Job with `environment: prod` | `repo:<OWNER>@<OWNER_ID>/<REPO>@<REPO_ID>:environment:prod` | `repo:<OWNER>/<REPO>:environment:prod` |
+| Branch job, no environment, non-PR | `repo:<OWNER>@<OWNER_ID>/<REPO>@<REPO_ID>:ref:refs/heads/main` | `repo:<OWNER>/<REPO>:ref:refs/heads/main` |
+| Tag job, no environment, non-PR | `repo:<OWNER>@<OWNER_ID>/<REPO>@<REPO_ID>:ref:refs/tags/v1.2.3` | `repo:<OWNER>/<REPO>:ref:refs/tags/v1.2.3` |
+
+See the [rollout, customization and environment-binding rules](deployment-runbook.md#github-oidc-subject-formats)
+before choosing a format. The supplied infrastructure does not create this trust.
 
 ```powershell
 az ad app federated-credential list --id <appId> --query '[].{name:name, subject:subject}' --output table

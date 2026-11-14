@@ -41,9 +41,9 @@ flowchart TB
     D2 --> D4
 
     subgraph OIDC["Authentication"]
-        O1["Request OIDC token<br/>subject repo:owner/repo:environment:dev"]
+        O1["Request OIDC token<br/>configured repository and dev environment subject"]
         O2["Entra ID validates the federated credential"]
-        O3["Access token, Azure AI User"]
+        O3["Access token; Foundry User authorization"]
     end
 
     D4 --> O1 --> O2 --> O3
@@ -122,7 +122,7 @@ Per-environment resolution and external state still change runtime behaviour.
 | Protection on `test` | Required reviewers, deployment branch policy limited to `main` |
 | Protection on `uat` | Required reviewers including the business owner |
 | Protection on `prod` | Required reviewers, wait timer, branch and tag policy for `main` and `v*.*.*` |
-| Federated credentials | One per environment: `repo:OWNER/REPO:environment:dev` and so on |
+| Federated credentials | Environment-bound credentials matching the repository's configured [OIDC subject format](../deployment-runbook.md#github-oidc-subject-formats) |
 | Ruleset on `main` | Require pull request, require the `validate` check, require code owner review, block force push |
 | Workflow permissions | Read repository contents by default; `id-token: write` only where OIDC is needed |
 

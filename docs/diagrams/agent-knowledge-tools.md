@@ -105,7 +105,7 @@ flowchart LR
     PROJ -->|Key Vault Secrets User| KV["Key Vault"]
 
     CICD["CI/CD workload identity"]
-    CICD -->|Azure AI User| PROJ
+    CICD -->|Foundry User| PROJ
     CICD -->|Key Vault Secrets User| KV
     CICD -->|Storage Blob Data Contributor| BLOB["Release record container"]
 ```

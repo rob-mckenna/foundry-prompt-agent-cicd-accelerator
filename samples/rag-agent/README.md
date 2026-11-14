@@ -37,7 +37,8 @@ Per environment:
 3. A project vector store if you use `uploaded-documents`. Set `VECTOR_STORE_ID` as a pipeline variable or in
    the overlay `variables` map. It is intentionally left unbound in the sample so that a missing value fails
    loudly rather than deploying an empty store.
-4. The deployment identity needs `Azure AI User` on the project and the search service needs a role
+4. The deployment identity needs `Foundry User` (formerly Azure AI User; role ID
+   `53ca6127-db72-4b80-b1b0-d745d6d5456d`) on the project and the search service needs a role
    assignment for the project managed identity (`Search Index Data Reader`).
 5. Model deployments named by the overlays, with model versions, regional support and retirement dates
    qualified for your use. Sample names are not current lifecycle guarantees.

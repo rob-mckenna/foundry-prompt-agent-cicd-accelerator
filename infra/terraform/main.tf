@@ -281,10 +281,10 @@ resource "azurerm_role_assignment" "project_key_vault_secrets_user" {
 resource "azurerm_role_assignment" "deployment_azure_ai_user" {
   count = var.deployment_principal_id == "" ? 0 : 1
 
-  scope                = azurerm_cognitive_account.foundry.id
-  role_definition_name = local.roles.azure_ai_user
-  principal_id         = var.deployment_principal_id
-  principal_type       = "ServicePrincipal"
+  scope              = azurerm_cognitive_account.foundry.id
+  role_definition_id = local.roles.azure_ai_user
+  principal_id       = var.deployment_principal_id
+  principal_type     = "ServicePrincipal"
 }
 
 resource "azurerm_role_assignment" "deployment_key_vault_secrets_user" {
@@ -308,8 +308,8 @@ resource "azurerm_role_assignment" "deployment_blob_contributor" {
 resource "azurerm_role_assignment" "operator_azure_ai_user" {
   count = var.agent_operator_principal_id == "" ? 0 : 1
 
-  scope                = azurerm_cognitive_account.foundry.id
-  role_definition_name = local.roles.azure_ai_user
-  principal_id         = var.agent_operator_principal_id
-  principal_type       = "Group"
+  scope              = azurerm_cognitive_account.foundry.id
+  role_definition_id = local.roles.azure_ai_user
+  principal_id       = var.agent_operator_principal_id
+  principal_type     = "Group"
 }

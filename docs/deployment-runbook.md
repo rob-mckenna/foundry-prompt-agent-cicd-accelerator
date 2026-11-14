@@ -55,13 +55,41 @@ $principalId = az ad sp show --id $appId --query id --output tsv
 $principalId   # you need this for the IaC parameters
 ```
 
-Add a federated credential. GitHub:
+#### GitHub OIDC subject formats
+
+Match the exact subject configured for your repository and job environment. Repositories created after
+July 15, 2026, or renamed/transferred after that date, use the immutable owner/repository-ID default.
+Earlier repositories retain the legacy default unless opted in. This rollout excludes GitHub Enterprise
+Server. See [GitHub's immutable subject guidance](https://docs.github.com/en/actions/reference/security/oidc#immutable-subject-claims).
+
+These are inert default-format examples; replace placeholders privately, never with published target IDs:
+
+| Job context | Immutable-ID subject | Legacy name-only subject |
+| --- | --- | --- |
+| `environment: dev` | `repo:<OWNER>@<OWNER_ID>/<REPO>@<REPO_ID>:environment:dev` | `repo:<OWNER>/<REPO>:environment:dev` |
+| `environment: prod` | `repo:<OWNER>@<OWNER_ID>/<REPO>@<REPO_ID>:environment:prod` | `repo:<OWNER>/<REPO>:environment:prod` |
+
+An environment-bound default subject takes precedence over branch/tag context; it does not restrict which
+branches may deploy. Configure environment deployment protection separately. Branch/tag default subjects
+apply only without an environment and outside pull-request context. Encode colons inside environment names
+as `%3A`.
+
+[Custom subject templates](https://docs.github.com/en/actions/reference/security/oidc#customizing-the-subject-claims-for-an-organization-or-repository)
+can replace the default structure; organization templates require repository opt-in. Match the complete
+customized subject and configure cloud trust before changing templates. Immutable IDs cannot be removed
+from the `repo` segment through `include_claim_keys`.
+
+The [issuer, subject and audience must match case-sensitively](https://learn.microsoft.com/en-us/entra/workload-id/workload-identity-federation#how-it-works).
+The infrastructure templates consume an existing principal; they do not create or migrate federated
+credentials. Authentication configuration alone grants no resource permissions.
+
+Add the GitHub federated credential using your exact environment-bound subject:
 
 ```powershell
 $credential = @{
   name = 'github-dev'
   issuer = 'https://token.actions.githubusercontent.com'
-  subject = 'repo:<owner>/<repo>:environment:dev'
+  subject = '<exact-environment-bound-subject>'
   audiences = @('api://AzureADTokenExchange')
 } | ConvertTo-Json -Compress
 

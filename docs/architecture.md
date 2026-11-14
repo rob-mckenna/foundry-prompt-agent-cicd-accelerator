@@ -105,10 +105,10 @@ flowchart LR
     end
 
     CICD["CI/CD workload identity<br/>one federated credential per environment"]
-    CICD -->|Azure AI User| DA
-    CICD -->|Azure AI User| TA
-    CICD -->|Azure AI User| UA
-    CICD -->|Azure AI User| PA
+    CICD -->|Foundry User| DA
+    CICD -->|Foundry User| TA
+    CICD -->|Foundry User| UA
+    CICD -->|Foundry User| PA
 ```
 
 ## GitHub to Foundry
@@ -213,8 +213,8 @@ sequenceDiagram
     participant AS as Agent Service
     participant ST as Release store
 
-    WF->>EID: OIDC token for repo:owner/repo:environment:prod
-    EID-->>WF: Access token (Azure AI User)
+    WF->>EID: OIDC token with configured repository and prod environment subject
+    EID-->>WF: Access token; Foundry User authorization
     Note over WF,EID: No client secret exists anywhere
     WF->>KV: Read secret referenced by the overlay
     KV-->>WF: SecureString, never logged
@@ -230,6 +230,16 @@ sequenceDiagram
     AS-->>WF: Release-bound live gate evidence
     WF->>ST: Complete-Release attests succeeded or failed
 ```
+
+**Foundry User** (formerly Azure AI User; built-in role ID `53ca6127-db72-4b80-b1b0-d745d6d5456d`)
+grants project authoring/data-plane permissions, not read-only access. Microsoft recommends the role GUID
+for automation during the rename rollout. Review the intended scope and inherited access: the supplied
+Bicep assignments are resource-group-scoped; Terraform's Foundry role assignments are account-scoped.
+This role alone grants neither agent application publishing nor permission to manage role assignments.
+See [Microsoft Foundry RBAC](https://learn.microsoft.com/en-us/azure/foundry/concepts/rbac-foundry#built-in-roles).
+
+Federated trust must match the repository's configured subject format, not a universal name-only string.
+See the [GitHub OIDC subject guidance](deployment-runbook.md#github-oidc-subject-formats).
 
 The preflight matters: it proves that the project endpoint, Azure identity and Python SDK bridge are usable
 before any version is created. It is not proof of runtime tool behaviour or post-deployment success.

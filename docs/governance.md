@@ -229,8 +229,9 @@ Before the first production deployment:
 
 - [ ] `CODEOWNERS` lists real teams and branch protection requires code owner review.
 - [ ] Federated credential subjects are scoped to the specific repository and environment.
-- [ ] The deployment identity holds only Azure AI User, Key Vault Secrets User and Storage Blob Data
-      Contributor.
+- [ ] The deployment identity's Foundry User, Key Vault Secrets User and Storage Blob Data Contributor
+      assignments have been reviewed at the intended scopes for the operations in use. Additional permissions
+      require separate approval; [Foundry User does not grant agent application publishing](architecture.md#identity-and-trust).
 - [ ] Humans do not hold write access to the production project.
 - [ ] `governance.allowedToolTypes` for production has been reviewed by security.
 - [ ] Every agent has an owner, a contact, a classification and a Responsible AI review id.

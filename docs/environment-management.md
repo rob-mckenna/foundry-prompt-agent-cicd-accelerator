@@ -205,9 +205,10 @@ Correct it by redeploying the recorded package:
 ./scripts/import-agent.ps1 -PackagePath ./artifacts/operations-copilot-2.1.0+ab12cd3.zip -Environment prod
 ```
 
-Prevent it by removing write access to production projects for humans. Operators should hold `Azure AI User`
-for read and test, not a role that can update an agent. The deployment identity should be the only principal
-that writes.
+Restrict production authoring to the deployment identity. [Foundry User](architecture.md#identity-and-trust)
+includes authoring permissions and is not a read-only operator role. For invocation-only access, evaluate
+Foundry Agent Consumer and any separately required read permissions; verify the intended scope and
+operations before granting access.
 
 Schedule the drift check weekly against PROD and UAT. An unexplained difference is an incident, not a
 housekeeping task.

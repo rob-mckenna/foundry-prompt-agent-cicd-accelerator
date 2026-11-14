@@ -31,6 +31,7 @@
     'Write-OpsLog',
         'Write-CiSummary',
         'Get-RepositoryRoot',
+        'Get-FoundryWorkRoot',
         'Resolve-RequiredPath',
         'ConvertTo-OrderedHashtable',
         'Read-JsonFile',

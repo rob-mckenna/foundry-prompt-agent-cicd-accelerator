@@ -853,14 +853,24 @@ Describe 'Real package format compatibility and repeat-build identity' {
     It 'treats an existing blob as idempotent only for identical archive bytes' {
         Mock az -ModuleName FoundryAgentOps { $global:LASTEXITCODE = 1; 'BlobAlreadyExists' }
         $global:ExistingArchive = $script:FixturePackagePath
-        Mock Get-AgentPackageFromStore -ModuleName FoundryAgentOps { $global:ExistingArchive }
+        Mock Get-AgentPackageFromStore -ModuleName FoundryAgentOps {
+            $global:ExistingArchiveDestination = $Destination
+            $global:ExistingArchive
+        }
         $cfg = @{ environment = 'test'; packageStore = @{ type = 'azureBlob'; accountName = 'offline'; container = 'packages' } }
-        Publish-AgentPackage -PackagePath $script:FixturePackagePath -AgentName $script:FixtureAgentName `
-            -PackageId $script:FixturePackageDescriptor['packageId'] -EnvironmentConfig $cfg -Confirm:$false | Should -Match '^https://'
-        $global:ExistingArchive = Join-Path $script:ScratchRoot 'different.zip'
-        Set-Content -LiteralPath $global:ExistingArchive -Value 'not the original archive'
-        { Publish-AgentPackage -PackagePath $script:FixturePackagePath -AgentName $script:FixtureAgentName `
-            -PackageId $script:FixturePackageDescriptor['packageId'] -EnvironmentConfig $cfg -Confirm:$false } | Should -Throw '*Archive byte conflict*'
+        $private = Join-Path $script:RepoRoot 'out/qualification/existing-archive-test'
+        $null = New-Item -ItemType Directory -Path $private -Force
+        $old = $env:FOUNDRY_QUALIFICATION_PRIVATE_ROOT
+        try {
+            $env:FOUNDRY_QUALIFICATION_PRIVATE_ROOT = $private
+            Publish-AgentPackage -PackagePath $script:FixturePackagePath -AgentName $script:FixtureAgentName `
+                -PackageId $script:FixturePackageDescriptor['packageId'] -EnvironmentConfig $cfg -Confirm:$false | Should -Match '^https://'
+            (Test-PathContainedIn -Root $private -Candidate $global:ExistingArchiveDestination) | Should -BeTrue
+            $global:ExistingArchive = Join-Path $script:ScratchRoot 'different.zip'
+            Set-Content -LiteralPath $global:ExistingArchive -Value 'not the original archive'
+            { Publish-AgentPackage -PackagePath $script:FixturePackagePath -AgentName $script:FixtureAgentName `
+                -PackageId $script:FixturePackageDescriptor['packageId'] -EnvironmentConfig $cfg -Confirm:$false } | Should -Throw '*Archive byte conflict*'
+        } finally { $env:FOUNDRY_QUALIFICATION_PRIVATE_ROOT = $old }
     }
 }
 
@@ -1018,6 +1028,41 @@ Describe 'Hosted offline validation contract' -Tag 'HostedOffline' {
         $workflow.IndexOf('name: Install Foundry SDK dependencies') | Should -BeLessThan $workflow.IndexOf('name: Run Python unit tests')
         $workflow.IndexOf('name: Install Foundry SDK dependencies') | Should -BeLessThan $workflow.IndexOf('name: Run offline validation suite')
         $testStep | Should -Not -Match 'continue-on-error|if:'
+    }
+}
+
+Describe 'Default-off DEV qualification workflow contract' -Tag 'DevQualification' {
+    It 'excludes every normal job only in qualification mode and preserves normal concurrency' {
+        $workflow = Get-Content -LiteralPath (Join-Path $script:RepoRoot '.github/workflows/deploy-dev.yml') -Raw
+        $workflow | Should -Match '(?s)qualificationMode:.*?type: boolean\s+default: false'
+        foreach ($job in @('validate', 'package', 'deploy', 'summary')) {
+            $workflow | Should -Match ("(?m)^  ${job}:\r?\n    " + [regex]::Escape('if: ${{ inputs.qualificationMode != true }}'))
+        }
+        $qualification = $workflow.Substring($workflow.IndexOf("`n  qualification:"))
+        $qualification | Should -Not -Match '_reusable-deploy|upload-artifact|RollbackOnFailure|needs\.package|GITHUB_TOKEN|gh api'
+        $qualification | Should -Match 'environment: dev'
+        $qualification | Should -Match 'git checkout --quiet --detach \$env:QUAL_EXPECTED_COMMIT'
+        $qualification | Should -Match 'credential.helper= -c core.askPass= -c http.extraHeader='
+        $qualification | Should -Not -Match 'actions/checkout@|github\.token|secrets\.GITHUB_TOKEN'
+        $workflow | Should -Match "dev-qualification-exclusive.*format\('deploy-dev-\{0\}', inputs\.agentPath \|\| 'samples/simple-agent'\)"
+    }
+
+    It 'binds each actual metadata secret only in the real step and masks before login' {
+        $workflow = Get-Content -LiteralPath (Join-Path $script:RepoRoot '.github/workflows/deploy-dev.yml') -Raw
+        . (Join-Path $script:RepoRoot 'scripts/Invoke-DevQualification.ps1')
+        $real = [regex]::Match($workflow, '(?s)- name: Bootstrap approved confidential metadata.*?(?=\n      - name:)').Value
+        foreach ($key in (Get-QualificationKeyPatterns).Keys) {
+            $real | Should -Match ([regex]::Escape("BOOT_${key}: " + '${{ secrets.' + $key + ' }}'))
+        }
+        @([regex]::Matches($real, 'secrets\.[A-Z_]+')).Count | Should -Be 13
+        [regex]::Match($real, '(?s)run: \|.*').Value | Should -Not -Match '\$\{\{'
+        $proof = [regex]::Match($workflow, '(?s)- name: Bootstrap inert privacy proof only.*?(?=\n      - name:)').Value
+        $proof | Should -Match 'secrets.QUAL_PRIVACY_SENTINEL'
+        $proof | Should -Not -Match 'secrets.AZURE_|secrets.QUAL_AGENT_NAME|secrets.QUAL_PROJECT_ENDPOINT'
+        $workflow.IndexOf('Initialize-QualificationEnvironment') |
+            Should -BeLessThan $workflow.IndexOf('name: Authenticate OIDC')
+        $workflow | Should -Not -Match 'azure/login@|--federated-token'
+        $workflow | Should -Match 'qualification-login'
     }
 }
 

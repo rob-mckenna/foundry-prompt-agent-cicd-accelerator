@@ -84,10 +84,20 @@ def _credential_kwargs(tenant_id: str | None) -> dict[str, Any]:
     return kwargs
 
 
-def _create_client(endpoint: str, tenant_id: str | None, *, runtime: bool = False, timeout: float = 30):
+def _create_client(
+    endpoint: str, tenant_id: str | None, *, runtime: bool = False,
+    timeout: float = 30, disable_create_retries: bool = False,
+):
     sdk = _load_sdk()
-    credential = sdk["DefaultAzureCredential"](**_credential_kwargs(tenant_id))
+    credential_options = _credential_kwargs(tenant_id)
+    if os.environ.get("FOUNDRY_QUALIFICATION_PRIVATE_ROOT"):
+        if os.environ.get("AZURE_TOKEN_CREDENTIALS") != "AzureCliCredential":
+            raise ValueError("QUAL_IDENTITY_BLOCKED")
+        credential_options["require_envvar"] = True
+    credential = sdk["DefaultAzureCredential"](**credential_options)
     options = dict(allow_preview=True, retry_total=0, connection_timeout=timeout, read_timeout=timeout) if runtime else {}
+    if disable_create_retries:
+        options.update(retry_total=0, retry_connect=0, retry_read=0, retry_status=0, logging_enable=False)
     client = sdk["AIProjectClient"](endpoint=endpoint, credential=credential, **options)
     return sdk, credential, client
 
@@ -491,7 +501,8 @@ def _handle_get_agent(args: argparse.Namespace) -> dict[str, Any]:
 
 def _handle_create_version(args: argparse.Namespace) -> dict[str, Any]:
     payload = _read_json_stdin()
-    sdk, credential, client = _create_client(args.endpoint, args.tenant_id)
+    options = {"disable_create_retries": True} if getattr(args, "disable_create_retries", False) else {}
+    sdk, credential, client = _create_client(args.endpoint, args.tenant_id, **options)
     try:
         definition_kwargs = _definition_to_sdk_kwargs(payload, sdk)
         definition = sdk["PromptAgentDefinition"](**definition_kwargs)
@@ -584,7 +595,9 @@ def _handle_invoke_agent(args: argparse.Namespace) -> dict[str, Any]:
     sdk, credential, client = _create_client(args.endpoint, args.tenant_id, runtime=True, timeout=remaining())
     openai_client = None
     conversation_id = None
+    conversation_attempted = False
     response_id = None
+    qualification = bool(os.environ.get("FOUNDRY_QUALIFICATION_PRIVATE_ROOT"))
     result: dict[str, Any] = {
         "Output": None, "Status": "failed", "Error": None,
         "ConversationId": None, "ResponseId": None,
@@ -598,6 +611,7 @@ def _handle_invoke_agent(args: argparse.Namespace) -> dict[str, Any]:
 
         verify_route()
         openai_client = client.get_openai_client(agent_name=args.agent_name, timeout=remaining(), max_retries=0)
+        conversation_attempted = True
         conversation = openai_client.conversations.create(timeout=remaining())
         conversation_id = conversation.id
         if not conversation_id:
@@ -636,18 +650,137 @@ def _handle_invoke_agent(args: argparse.Namespace) -> dict[str, Any]:
     except Exception as exc:
         result.update(Status="failed", Output=None, Error=str(exc))
     finally:
+        primary_status = result["Status"]
+        cleanup_failures = []
+        disposition = "unverified" if conversation_attempted else "not-created"
         if conversation_id and openai_client:
             try:
                 openai_client.conversations.delete(conversation_id, timeout=remaining(deadline))
+                disposition = "deleted"
             except Exception as exc:
-                _warn(f"Conversation {conversation_id} cleanup failed: {exc}")
-        for resource in (openai_client, client, credential):
+                disposition = "failed"
+                cleanup_failures.append("conversation-delete-failed")
+                if not qualification:
+                    _warn(f"Conversation {conversation_id} cleanup failed: {exc}")
+        elif conversation_attempted:
+            cleanup_failures.append("conversation-creation-unverified")
+        resources_closed = True
+        for name, resource in (("openai-client", openai_client), ("project-client", client), ("credential", credential)):
             try:
                 _close_if_supported(resource)
             except Exception as exc:
-                _warn(f"Client cleanup failed: {exc}")
+                resources_closed = False
+                cleanup_failures.append(f"{name}-close-failed")
+                if not qualification:
+                    _warn(f"Client cleanup failed: {exc}")
+        if qualification:
+            verified = not cleanup_failures and disposition in ("deleted", "not-created") and resources_closed
+            result.update(
+                PrimaryStatus=primary_status,
+                InvocationCleanup={
+                    "verified": verified, "conversationDisposition": disposition,
+                    "resourcesClosed": resources_closed, "failureCategories": cleanup_failures,
+                },
+            )
+            if not verified:
+                result.update(Status="failed" if primary_status == "completed" else primary_status, Output=None)
+                if not result["Error"]:
+                    result["Error"] = "QUAL_INVOCATION_CLEANUP_FAILED"
         result.update(ConversationId=conversation_id, ResponseId=response_id, LatencyMs=int((time.monotonic() - start) * 1000))
     return result
+
+
+def _handle_qualification_login(_args: argparse.Namespace) -> dict[str, Any]:
+    # In-process invocation avoids an OS credential argument, not CLI/MSAL disk caching.
+    # The workflow owns the isolated credential-bearing directory and its final teardown.
+    import contextlib
+    import io
+    import urllib.parse
+    import urllib.request
+
+    from azure.cli.core import get_default_cli
+
+    try:
+        url = os.environ["ACTIONS_ID_TOKEN_REQUEST_URL"]
+        url += ("&" if "?" in url else "?") + urllib.parse.urlencode({"audience": "api://AzureADTokenExchange"})
+        request = urllib.request.Request(
+            url, headers={"Authorization": "Bearer " + os.environ["ACTIONS_ID_TOKEN_REQUEST_TOKEN"]})
+        with urllib.request.urlopen(request, timeout=30) as response:
+            federated_token = json.load(response)["value"]
+        if not isinstance(federated_token, str) or not federated_token:
+            raise ValueError("Missing OIDC response")
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            cli = get_default_cli()
+            status = cli.invoke([
+                "login", "--service-principal", "--username", os.environ["AZURE_CLIENT_ID"],
+                "--tenant", os.environ["AZURE_TENANT_ID"], "--federated-token", federated_token,
+                "--only-show-errors", "--output", "none",
+            ])
+            if status != 0:
+                raise ValueError("Login failed")
+            status = cli.invoke([
+                "account", "set", "--subscription", os.environ["AZURE_SUBSCRIPTION_ID"],
+                "--only-show-errors",
+            ])
+            if status != 0:
+                raise ValueError("Subscription selection failed")
+        return {"authenticated": True}
+    except Exception:
+        raise RuntimeError("QUAL_IDENTITY_BLOCKED") from None
+
+
+def _qualification_snapshot(client, sdk) -> dict[str, Any]:
+    model = os.environ["QUAL_MODEL_DEPLOYMENT"]
+    matched = any(getattr(deployment, "name", None) == model for deployment in client.deployments.list())
+    if not matched:
+        raise ValueError("QUAL_MODEL_BLOCKED")
+    name = os.environ["QUAL_AGENT_NAME"]
+    try:
+        agent = client.agents.get(agent_name=name)
+    except sdk["ResourceNotFoundError"]:
+        return {"found": False, "modelMatched": True}
+    versions = sorted([
+        {"id": version.id, "version": version.version, "metadata": version.metadata or {}}
+        for version in client.agents.list_versions(agent_name=name)
+    ], key=lambda version: version["id"])
+    active = _active_version(agent)
+    active_details = client.agents.get_version(agent_name=name, agent_version=active)
+    active_definition = active_details.definition.as_dict()
+    active_definition["tools"] = active_definition.get("tools") or []
+    return {
+        "found": True, "modelMatched": True, "id": agent.id, "name": agent.name,
+        "activeVersion": active, "versions": versions,
+        "activeDefinition": active_definition,
+    }
+
+
+def _handle_qualification_target(args: argparse.Namespace) -> dict[str, Any]:
+    if os.environ.get("AZURE_TOKEN_CREDENTIALS") != "AzureCliCredential":
+        raise ValueError("QUAL_IDENTITY_BLOCKED")
+    sdk, credential, client = _create_client(
+        os.environ["QUAL_PROJECT_ENDPOINT"], os.environ["AZURE_TENANT_ID"], disable_create_retries=True)
+    try:
+        snapshot = _qualification_snapshot(client, sdk)
+        if args.command == "qualification-snapshot":
+            return snapshot
+        expected = _read_json_stdin()
+        if not snapshot["found"] or not expected.get("found") or snapshot != expected:
+            raise ValueError("QUAL_CLEANUP_BLOCKED")
+        if not snapshot["versions"] or len(snapshot["versions"]) > 3 or any(
+            version["metadata"].get("qualification_experiment") != os.environ["QUAL_EXPERIMENT_ID"]
+            for version in snapshot["versions"]
+        ):
+            raise ValueError("QUAL_CLEANUP_BLOCKED")
+        # No force-delete or unrelated resource enumeration.
+        client.agents.delete(agent_name=os.environ["QUAL_AGENT_NAME"])
+        try:
+            client.agents.get(agent_name=os.environ["QUAL_AGENT_NAME"])
+        except sdk["ResourceNotFoundError"]:
+            return {"absent": True, "deleted": snapshot}
+        raise ValueError("QUAL_CLEANUP_BLOCKED")
+    finally:
+        _close_if_supported(client)
+        _close_if_supported(credential)
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -675,6 +808,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     create_version = subparsers.add_parser("create-version")
     add_common_arguments(create_version, include_agent_name=True)
+    create_version.add_argument("--disable-create-retries", action="store_true")
     create_version.set_defaults(handler=_handle_create_version)
 
     promote_version = subparsers.add_parser("promote-version")
@@ -686,6 +820,12 @@ def _build_parser() -> argparse.ArgumentParser:
     add_common_arguments(invoke_agent, include_agent_name=True)
     invoke_agent.add_argument("--agent-version", required=True)
     invoke_agent.set_defaults(handler=_handle_invoke_agent)
+
+    login = subparsers.add_parser("qualification-login")
+    login.set_defaults(handler=_handle_qualification_login)
+    for command in ("qualification-snapshot", "qualification-delete"):
+        qualification = subparsers.add_parser(command)
+        qualification.set_defaults(handler=_handle_qualification_target)
 
     return parser
 

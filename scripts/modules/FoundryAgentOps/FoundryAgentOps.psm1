@@ -107,6 +107,23 @@ function Resolve-RequiredPath {
     return (Resolve-Path -LiteralPath $Path).Path
 }
 
+function Get-FoundryWorkRoot {
+    [CmdletBinding()]
+    [OutputType([string])]
+    param([string]$DefaultRelativePath = 'out/platform-work')
+    $repository = Get-RepositoryRoot
+    if (-not $env:FOUNDRY_QUALIFICATION_PRIVATE_ROOT) { return (Join-Path $repository $DefaultRelativePath) }
+    $root = [IO.Path]::GetFullPath($env:FOUNDRY_QUALIFICATION_PRIVATE_ROOT)
+    $auth = Join-Path $repository 'out/qualification/authentication'
+    if (-not (Test-PathContainedIn -Root (Join-Path $repository 'out/qualification') -Candidate $root) -or
+        $root.Equals($auth, [StringComparison]::OrdinalIgnoreCase) -or
+        (Test-PathContainedIn -Root $auth -Candidate $root) -or
+        (Test-PathHasReparsePoint -Root $repository -Path $root) -or -not (Test-Path -LiteralPath $root -PathType Container)) {
+        throw 'QUAL_PATH_BLOCKED'
+    }
+    return $root
+}
+
 #endregion
 
 #region Data shaping
@@ -2111,7 +2128,7 @@ function Publish-AgentPackage {
     if ($LASTEXITCODE -ne 0) {
         # A blob that already exists is the expected outcome for a content-addressed store.
         if (($output | Out-String) -match 'BlobAlreadyExists|already exists') {
-            $scratch = Join-Path (Get-RepositoryRoot) "out\publication-$([Guid]::NewGuid().ToString('n'))"
+            $scratch = Join-Path (Get-FoundryWorkRoot -DefaultRelativePath 'out') "publication-$([Guid]::NewGuid().ToString('n'))"
             New-Item -ItemType Directory -Force -Path $scratch | Out-Null
             try {
                 $retained = Get-AgentPackageFromStore -AgentName $AgentName -PackageId $PackageId -EnvironmentConfig $EnvironmentConfig -Destination (Join-Path $scratch 'retained.zip')
@@ -2192,7 +2209,7 @@ function Find-AgentPackage {
     foreach ($directory in $SearchDirectory) {
         if (-not $directory -or -not (Test-Path -LiteralPath $directory)) { continue }
         foreach ($candidate in (Get-ChildItem -LiteralPath $directory -Recurse -Filter '*.zip' -File)) {
-            $extractRoot = Join-Path (Get-RepositoryRoot) ("out\platform-work\foundry-find-" + [Guid]::NewGuid().ToString('n'))
+            $extractRoot = Join-Path (Get-FoundryWorkRoot) ("foundry-find-" + [Guid]::NewGuid().ToString('n'))
             try {
                 $root = Expand-AgentPackage -PackagePath $candidate.FullName -Destination $extractRoot
                 $descriptor = Read-PackageDescriptor -PackageRoot $root
@@ -2213,7 +2230,7 @@ function Find-AgentPackage {
         $target = Join-Path $DownloadDirectory "$AgentName-$($PackageId -replace '^sha256:', '').zip"
         $downloaded = Get-AgentPackageFromStore -AgentName $AgentName -PackageId $PackageId -EnvironmentConfig $EnvironmentConfig -Destination $target
         if ($downloaded) {
-            $extractRoot = Join-Path (Get-RepositoryRoot) ("out\platform-work\foundry-find-" + [Guid]::NewGuid().ToString('n'))
+            $extractRoot = Join-Path (Get-FoundryWorkRoot) ("foundry-find-" + [Guid]::NewGuid().ToString('n'))
             try {
                 $root = Expand-AgentPackage -PackagePath $downloaded -Destination $extractRoot
                 $descriptor = Read-PackageDescriptor -PackageRoot $root
@@ -2432,10 +2449,11 @@ function New-FoundryAgentVersion {
     param(
         [Parameter(Mandatory)][System.Collections.IDictionary]$EnvironmentConfig,
         [Parameter(Mandatory)][string]$LogicalName,
-        [Parameter(Mandatory)][System.Collections.IDictionary]$Payload
+        [Parameter(Mandatory)][System.Collections.IDictionary]$Payload,
+        [switch]$DisableCreateRetries
     )
 
-    return Invoke-FoundryPythonCli -Subcommand 'create-version' -EnvironmentConfig $EnvironmentConfig -LogicalName $LogicalName -InputObject $Payload
+    return Invoke-FoundryPythonCli -Subcommand 'create-version' -EnvironmentConfig $EnvironmentConfig -LogicalName $LogicalName -InputObject $Payload -DisableCreateRetries:$DisableCreateRetries
 }
 
 function Set-FoundryAgentActiveVersion {
@@ -2464,10 +2482,64 @@ function Invoke-FoundryAgentRun {
         [ValidateRange(1, 600)][int]$PollIntervalSeconds = 2
     )
 
-    return Invoke-FoundryPythonCli -Subcommand 'invoke-agent' -EnvironmentConfig $EnvironmentConfig `
+    $result = Invoke-FoundryPythonCli -Subcommand 'invoke-agent' -EnvironmentConfig $EnvironmentConfig `
         -LogicalName $LogicalName -AgentVersion $AgentVersion -InputObject @{
             prompt = $Prompt; timeoutSeconds = $TimeoutSeconds; pollIntervalSeconds = $PollIntervalSeconds
         } -ProcessTimeoutSeconds ($TimeoutSeconds + 10)
+    if ($env:FOUNDRY_QUALIFICATION_PRIVATE_ROOT) {
+        $root = Get-FoundryWorkRoot
+        $value = ConvertTo-OrderedHashtable -InputObject $result
+        $cleanup = if ($value -is [System.Collections.IDictionary] -and $value.Contains('InvocationCleanup')) {
+            $value['InvocationCleanup']
+        } else { $null }
+        $primary = if ($value -is [System.Collections.IDictionary] -and $value.Contains('PrimaryStatus') -and
+            $value['PrimaryStatus'] -is [string] -and
+            $value['PrimaryStatus'] -cin @('completed','failed','timeout','incomplete','cancelled','requires_action','queued','in_progress')) {
+            $value['PrimaryStatus']
+        } else { 'unknown' }
+        $categories = @('conversation-delete-failed','conversation-creation-unverified',
+            'openai-client-close-failed','project-client-close-failed','credential-close-failed')
+        $valid = $cleanup -is [System.Collections.IDictionary] -and $cleanup.Count -eq 4 -and
+            $cleanup.Contains('verified') -and $cleanup['verified'] -is [bool] -and
+            $cleanup.Contains('resourcesClosed') -and $cleanup['resourcesClosed'] -is [bool] -and
+            $cleanup.Contains('conversationDisposition') -and
+            $cleanup['conversationDisposition'] -is [string] -and
+            $cleanup['conversationDisposition'] -cin @('deleted','not-created','failed','unverified') -and
+            $cleanup.Contains('failureCategories') -and $cleanup['failureCategories'] -is [array] -and
+            $cleanup['failureCategories'].Count -le 5 -and
+            @($cleanup['failureCategories'] | Where-Object { $_ -isnot [string] -or $_ -cnotin $categories }).Count -eq 0 -and
+            $primary -cne 'unknown'
+        if ($valid -and $cleanup['verified']) {
+            if (-not $cleanup['resourcesClosed'] -or $cleanup['failureCategories'].Count -ne 0 -or
+                $cleanup['conversationDisposition'] -cnotin @('deleted','not-created') -or
+                ($cleanup['conversationDisposition'] -ceq 'deleted' -and
+                    (-not $value.Contains('ConversationId') -or -not $value['ConversationId'])) -or
+                ($cleanup['conversationDisposition'] -ceq 'not-created' -and
+                    ($primary -ceq 'completed' -or ($value.Contains('ConversationId') -and $value['ConversationId'])))) {
+                $valid = $false
+            }
+        } elseif ($valid -and $cleanup['failureCategories'].Count -eq 0) { $valid = $false }
+        if (-not $valid -or -not $cleanup['verified']) {
+            $category = if ($valid) { 'QUAL_INVOCATION_CLEANUP_FAILED' } else { 'QUAL_INVOCATION_CLEANUP_UNVERIFIED' }
+            $receipt = [ordered]@{
+                category = $category; primaryStatus = $primary; primaryCategory = "invocation-$primary"
+                invocationCleanupVerified = $false
+                cleanupCategories = @(if ($valid) { $cleanup['failureCategories'] } else { 'invalid-envelope' })
+            }
+            foreach ($key in @('ResponseId','ConversationId')) {
+                if ($value -is [System.Collections.IDictionary] -and $value.Contains($key) -and
+                    $value[$key] -is [string] -and $value[$key] -cmatch '^[A-Za-z0-9._:/-]{1,512}$') {
+                    $receipt[$key] = $value[$key]
+                }
+            }
+            try {
+                Write-JsonFile -InputObject $receipt -Path (Join-Path $root "invocation-cleanup-$([guid]::NewGuid().ToString('n')).json") `
+                    -Depth 8 -Confirm:$false -WhatIf:$false | Out-Null
+            } catch { throw 'QUAL_INVOCATION_CLEANUP_UNVERIFIED' }
+            throw $category
+        }
+    }
+    return $result
 }
 
 function Get-FoundryReleaseTarget {
@@ -2852,7 +2924,7 @@ function Get-LatestReleaseRecord {
 
     if ($EnvironmentConfig.Contains('releaseStore') -and $EnvironmentConfig['releaseStore'] -and $EnvironmentConfig['releaseStore']['type'] -eq 'azureBlob') {
         $store = $EnvironmentConfig['releaseStore']
-        $scratch = Join-Path (Get-RepositoryRoot) 'out\platform-work'
+        $scratch = Get-FoundryWorkRoot
         New-Item -ItemType Directory -Force -Path $scratch | Out-Null
         $tempFile = Join-Path $scratch ("release-$([Guid]::NewGuid().ToString('n')).json")
         $arguments = @(
@@ -2897,7 +2969,7 @@ function Get-ReleaseRecordById {
     if (Test-Path -LiteralPath $path) { return Read-ReleaseRecordFile -Path $path }
     if (-not $EnvironmentConfig['releaseStore'] -or $EnvironmentConfig['releaseStore']['type'] -ne 'azureBlob') { return $null }
     $store = $EnvironmentConfig['releaseStore']
-    $scratch = Join-Path (Get-RepositoryRoot) 'out\platform-work'
+    $scratch = Get-FoundryWorkRoot
     New-Item -ItemType Directory -Force -Path $scratch | Out-Null
     $download = Join-Path $scratch "$([Guid]::NewGuid().ToString('n')).json"
     try {
@@ -2923,7 +2995,8 @@ function Invoke-FoundryPythonCli {
         [string]$LogicalName,
         [string]$AgentVersion,
         [AllowNull()][System.Collections.IDictionary]$InputObject,
-        [ValidateRange(1, 660)][int]$ProcessTimeoutSeconds = 180
+        [ValidateRange(1, 660)][int]$ProcessTimeoutSeconds = 180,
+        [switch]$DisableCreateRetries
     )
 
     $repoRoot = Get-RepositoryRoot
@@ -2964,6 +3037,10 @@ function Invoke-FoundryPythonCli {
     }
     if ($tenantId) {
         $arguments += @('--tenant-id', $tenantId)
+    }
+    if ($DisableCreateRetries) {
+        if ($Subcommand -ne 'create-version') { throw 'Create retry control only applies to create-version.' }
+        $arguments += '--disable-create-retries'
     }
 
     $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
@@ -3059,6 +3136,7 @@ Export-ModuleMember -Function @(
     'Write-OpsLog',
     'Write-CiSummary',
     'Get-RepositoryRoot',
+    'Get-FoundryWorkRoot',
     'Resolve-RequiredPath',
     'ConvertTo-OrderedHashtable',
     'Read-JsonFile',

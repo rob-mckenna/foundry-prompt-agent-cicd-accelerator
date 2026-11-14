@@ -2,13 +2,16 @@ import contextlib
 import importlib.util
 import io
 import json
+import os
 import pathlib
 import py_compile
+import shutil
 import subprocess
 import sys
 import textwrap
 import types
 import unittest
+import uuid
 from unittest import mock
 
 
@@ -167,11 +170,299 @@ install_fake_azure_modules()
 import foundry_agent_cli  # noqa: E402
 
 
+def real_runtime_cleanup_probe():
+    script = textwrap.dedent(r"""
+        import contextlib, io, json, os, sys, types
+        from unittest import mock
+        sys.path.insert(0, sys.argv[1])
+        import foundry_agent_cli as bridge
+        import httpx2
+        from azure.ai.projects import AIProjectClient
+        from azure.ai.projects.models import AgentDetails
+
+        def exercise(kind, qualification=True):
+            requests = []
+            def handle(request):
+                requests.append({"method": request.method, "path": request.url.path})
+                failing = (request.method == "DELETE" and kind in ("delete", "primary-and-delete"))
+                failing |= (request.url.path.endswith("/responses") and kind == "primary-and-delete")
+                failing |= (request.url.path.endswith("/conversations") and request.method == "POST" and kind == "ambiguous-create")
+                if failing:
+                    return httpx2.Response(503, headers={"Retry-After": "0"},
+                        json={"error": {"code": "ServiceUnavailable", "message": "offline injected failure"}})
+                if request.method == "DELETE":
+                    body = {"id": "conv_offline", "object": "conversation.deleted", "deleted": True}
+                elif request.url.path.endswith("/conversations"):
+                    body = {"id": "conv_offline", "object": "conversation", "created_at": 1, "metadata": {}}
+                else:
+                    body = {"id": "resp_offline", "object": "response", "created_at": 1, "status": "completed", "model": "offline",
+                        "output": [{"type": "message", "id": "msg_1", "role": "assistant", "status": "completed",
+                            "content": [{"type": "output_text", "annotations": [],
+                                "text": "Standard delivery takes 3 to 5 business days. I cannot share internal configuration."}]}]}
+                return httpx2.Response(200, json=body)
+            transport = httpx2.Client(transport=httpx2.MockTransport(handle))
+            client = AIProjectClient(endpoint="https://example.invalid/api/projects/offline", credential=object(), allow_preview=True)
+            real_factory = client.get_openai_client
+            def factory(**kwargs):
+                return real_factory(**kwargs, api_key="inert-offline-token", http_client=transport)
+            agent = AgentDetails({"id": "agent-id", "name": "offline-agent", "state": "enabled", "configuration_state": "enabled",
+                "agent_endpoint": {"version_selector": {"version_selection_rules": [
+                    {"type": "FixedRatio", "agent_version": "opaque-v1", "traffic_percentage": 100}]},
+                    "protocol_configuration": {"responses": {}}}})
+            args = types.SimpleNamespace(endpoint="https://example.invalid/api/projects/offline",
+                tenant_id=None, agent_name="offline-agent", agent_version="opaque-v1")
+            stderr = io.StringIO()
+            credential = mock.Mock()
+            if kind == "close": credential.close.side_effect = RuntimeError("inert close failure")
+            env = dict(os.environ)
+            env.pop("FOUNDRY_QUALIFICATION_PRIVATE_ROOT", None)
+            if qualification: env["FOUNDRY_QUALIFICATION_PRIVATE_ROOT"] = "inert-offline-context"
+            with mock.patch.dict(os.environ, env, clear=True), \
+                 mock.patch.object(bridge, "_create_client", return_value=(bridge._load_sdk(), credential, client)), \
+                 mock.patch.object(client.agents, "get", return_value=agent), \
+                 mock.patch.object(client, "get_openai_client", side_effect=factory), \
+                 mock.patch.object(bridge, "_read_json_stdin", return_value={"prompt": "inert prompt", "timeoutSeconds": 10}), \
+                 contextlib.redirect_stderr(stderr):
+                result = bridge._handle_invoke_agent(args)
+            return {"result": result, "requests": requests, "stderr": stderr.getvalue(),
+                "credentialCloseAttempts": credential.close.call_count}
+        print(json.dumps({
+            "success": exercise("success"), "delete": exercise("delete"),
+            "ordinary": exercise("delete", False), "primary-and-delete": exercise("primary-and-delete"),
+            "close": exercise("close"), "ambiguous-create": exercise("ambiguous-create")}))
+    """)
+    completed = subprocess.run(
+        [sys.executable, "-c", script, str(PYTHON_SCRIPTS)], cwd=REPO_ROOT,
+        capture_output=True, text=True, timeout=120,
+    )
+    if completed.returncode:
+        raise AssertionError(completed.stderr)
+    return json.loads(completed.stdout)
+
+
 class FoundryAgentCliTests(unittest.TestCase):
     def setUp(self):
         reset_fake_sdk_state()
         FakeAIProjectClient.instances.clear()
         FakeDefaultAzureCredential.instances.clear()
+
+    def test_real_transport_qualification_cleanup_is_typed_fatal_and_does_not_retry(self):
+        cases = real_runtime_cleanup_probe()
+        self.assertTrue(cases["success"]["result"]["InvocationCleanup"]["verified"])
+        for key in ("delete", "primary-and-delete", "close", "ambiguous-create"):
+            result = cases[key]["result"]
+            with self.subTest(case=key):
+                self.assertEqual("failed", result["Status"])
+                self.assertIsNone(result["Output"])
+                self.assertFalse(result["InvocationCleanup"]["verified"])
+                self.assertEqual(1, cases[key]["credentialCloseAttempts"])
+                self.assertLessEqual(sum(r["method"] == "POST" and r["path"].endswith("/responses")
+                                         for r in cases[key]["requests"]), 1)
+                self.assertEqual(0 if key == "ambiguous-create" else 1,
+                                 sum(r["method"] == "DELETE" for r in cases[key]["requests"]))
+        self.assertEqual("completed", cases["delete"]["result"]["PrimaryStatus"])
+        self.assertIn("conversation-delete-failed", cases["delete"]["result"]["InvocationCleanup"]["failureCategories"])
+        self.assertEqual("failed", cases["primary-and-delete"]["result"]["PrimaryStatus"])
+        self.assertIn("503", cases["primary-and-delete"]["result"]["Error"])
+        self.assertIn("conversation-delete-failed", cases["primary-and-delete"]["result"]["InvocationCleanup"]["failureCategories"])
+        self.assertEqual("deleted", cases["close"]["result"]["InvocationCleanup"]["conversationDisposition"])
+        self.assertIn("credential-close-failed", cases["close"]["result"]["InvocationCleanup"]["failureCategories"])
+        self.assertEqual("unverified", cases["ambiguous-create"]["result"]["InvocationCleanup"]["conversationDisposition"])
+        self.assertEqual("completed", cases["ordinary"]["result"]["Status"])
+        self.assertNotIn("InvocationCleanup", cases["ordinary"]["result"])
+        self.assertIn("cleanup failed", cases["ordinary"]["stderr"])
+
+    def test_actual_installed_cli_persists_inert_assertion_only_to_stub_owned_store(self):
+        az = shutil.which("az")
+        if not az:
+            self.skipTest("Installed Azure CLI unavailable; actual persistence remains unverified")
+        if os.name == "nt":
+            interpreter = pathlib.Path(az).parent.parent / "python.exe"
+        else:
+            interpreter = pathlib.Path(pathlib.Path(az).read_text(encoding="utf-8").splitlines()[0].removeprefix("#!"))
+        if not interpreter.is_file():
+            self.skipTest("Installed CLI interpreter unavailable; actual persistence remains unverified")
+        root = REPO_ROOT / "out" / "qualification" / "authentication" / ("inert-cli-" + uuid.uuid4().hex)
+        root.mkdir(parents=True)
+        fixture = root / "inert-auth-store.json"
+        script = textwrap.dedent(r"""
+            import json, pathlib, sys, types
+            from unittest import mock
+            from azure.cli.core.auth import identity
+            assertion = "inert-not-a-token-qualification-fixture"
+            destination = pathlib.Path(sys.argv[1])
+            class Store:
+                def save_entry(self, entry):
+                    assert entry["client_assertion"] == assertion
+                    destination.write_text(json.dumps(entry), encoding="utf-8")
+            owner = types.SimpleNamespace(tenant_id="inert-tenant", _msal_app_kwargs={},
+                _service_principal_store=Store())
+            with mock.patch.object(identity, "ServicePrincipalCredential") as credential, \
+                 mock.patch("socket.socket.connect", side_effect=AssertionError("network forbidden")):
+                credential.return_value.acquire_token.return_value = {"access_token": "inert-acquisition-result"}
+                identity.Identity.login_with_service_principal(owner, "inert-client",
+                    {"client_assertion": assertion}, ["inert-scope"])
+                credential.return_value.acquire_token.assert_called_once()
+            assert json.loads(destination.read_text(encoding="utf-8"))["client_assertion"] == assertion
+            print('{"actualCliPersistenceExercised":true,"inertAssertionPersisted":true}')
+        """)
+        environment = dict(os.environ, AZURE_CONFIG_DIR=str(root))
+        completed = subprocess.run([str(interpreter), "-I", "-c", script, str(fixture)],
+                                   cwd=REPO_ROOT, env=environment, capture_output=True, text=True, timeout=90)
+        self.assertEqual(0, completed.returncode, completed.stderr)
+        self.assertEqual({"actualCliPersistenceExercised": True, "inertAssertionPersisted": True},
+                         json.loads(completed.stdout))
+        self.assertNotIn("inert-not-a-token", completed.stdout + completed.stderr)
+
+    def test_qualification_create_has_one_real_transport_attempt_on_retryable_failure(self):
+        script = textwrap.dedent("""
+            import sys
+            from unittest import mock
+            from azure.ai.projects import AIProjectClient
+            from azure.core.credentials import AccessToken
+            from azure.core.exceptions import HttpResponseError
+            from azure.core.pipeline.transport import HttpResponse, HttpTransport
+            print("SDK_IMPORT_READY", flush=True)
+            sys.path.insert(0, sys.argv[1])
+            import foundry_agent_cli as bridge
+
+            class Credential:
+                def get_token(self, *args, **kwargs):
+                    return AccessToken("inert-offline-token", 9999999999)
+                def close(self):
+                    pass
+
+            class RetryableResponse(HttpResponse):
+                def __init__(self, request):
+                    super().__init__(request, None)
+                    self.status_code = 503
+                    self.headers = {"Content-Type": "application/json", "Retry-After": "0"}
+                    self.reason = "Service Unavailable"
+                    self.content_type = "application/json"
+                def body(self):
+                    return b'{"error":{"code":"ServiceUnavailable","message":"offline retryable failure"}}'
+
+            class Transport(HttpTransport):
+                attempts = 0
+                def open(self):
+                    pass
+                def close(self):
+                    pass
+                def __enter__(self):
+                    return self
+                def __exit__(self, *args):
+                    pass
+                def send(self, request, **kwargs):
+                    assert request.method == "POST"
+                    self.attempts += 1
+                    print("CREATE_ATTEMPT", self.attempts, flush=True)
+                    return RetryableResponse(request)
+
+            transport = Transport()
+            def client_factory(**kwargs):
+                return AIProjectClient(**kwargs, transport=transport, retry_backoff_factor=0)
+
+            with mock.patch("azure.identity.DefaultAzureCredential", return_value=Credential()), \\
+                 mock.patch("azure.ai.projects.AIProjectClient", side_effect=client_factory):
+                sdk, credential, baseline = bridge._create_client(
+                    "https://offline.services.ai.azure.com/api/projects/offline", None)
+                try:
+                    baseline.agents.create_version(
+                        agent_name="offline-agent",
+                        definition=sdk["PromptAgentDefinition"](model="offline-model", instructions="Benign."))
+                except HttpResponseError:
+                    pass
+                finally:
+                    baseline.close()
+                assert transport.attempts > 1, transport.attempts
+                transport.attempts = 0
+                sdk, credential, client = bridge._create_client(
+                    "https://offline.services.ai.azure.com/api/projects/offline", None,
+                    disable_create_retries=True)
+                try:
+                    client.agents.create_version(
+                        agent_name="offline-agent",
+                        definition=sdk["PromptAgentDefinition"](model="offline-model", instructions="Benign."))
+                except HttpResponseError:
+                    pass
+                else:
+                    raise AssertionError("retryable failure was swallowed")
+                finally:
+                    client.close()
+            assert transport.attempts == 1, transport.attempts
+        """)
+        executable = (
+            ["py", f"-{sys.version_info.major}.{sys.version_info.minor}"]
+            if sys.platform == "win32" else [sys.executable]
+        )
+        try:
+            completed = subprocess.run(
+                [*executable, "-c", script, str(PYTHON_SCRIPTS)],
+                text=True, capture_output=True, timeout=120)
+        except subprocess.TimeoutExpired as exc:
+            self.fail(f"Offline transport probe timed out: {exc.stdout!r}; {exc.stderr!r}")
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
+    def test_qualification_login_keeps_federated_token_in_process_and_discards_cli_output(self):
+        import urllib.request
+
+        calls = []
+        token = "inert-oidc-token-not-a-credential"
+        class Cli:
+            def invoke(self, arguments):
+                calls.append(arguments)
+                print(token)
+                print(token, file=sys.stderr)
+                return 0
+        core = types.ModuleType("azure.cli.core")
+        core.get_default_cli = lambda: Cli()
+        env = {
+            "ACTIONS_ID_TOKEN_REQUEST_URL": "https://example.invalid/oidc?request=offline",
+            "ACTIONS_ID_TOKEN_REQUEST_TOKEN": "inert-request-token",
+            "AZURE_CLIENT_ID": "offline-client", "AZURE_TENANT_ID": "offline-tenant",
+            "AZURE_SUBSCRIPTION_ID": "offline-subscription",
+        }
+        response = io.BytesIO(json.dumps({"value": token}).encode())
+        output, error = io.StringIO(), io.StringIO()
+        with mock.patch.dict(sys.modules, {"azure.cli.core": core}), mock.patch.dict(os.environ, env), \
+             mock.patch.object(urllib.request, "urlopen", return_value=response), \
+             mock.patch.object(subprocess, "Popen") as process, \
+             contextlib.redirect_stdout(output), contextlib.redirect_stderr(error):
+            result = foundry_agent_cli._handle_qualification_login(types.SimpleNamespace())
+        self.assertEqual(result, {"authenticated": True})
+        self.assertEqual(calls[0][calls[0].index("--federated-token") + 1], token)
+        process.assert_not_called()
+        self.assertNotIn(token, output.getvalue() + error.getvalue() + json.dumps(result))
+
+    def test_qualification_preflight_requires_exact_model_and_agent_absence(self):
+        client = types.SimpleNamespace(
+            deployments=types.SimpleNamespace(list=mock.Mock(return_value=[])),
+            agents=types.SimpleNamespace(get=mock.Mock(side_effect=FakeResourceNotFoundError())))
+        sdk = {"ResourceNotFoundError": FakeResourceNotFoundError}
+        with mock.patch.dict(os.environ, {"QUAL_MODEL_DEPLOYMENT": "offline-model", "QUAL_AGENT_NAME": "offline-agent"}):
+            with self.assertRaisesRegex(ValueError, "QUAL_MODEL_BLOCKED"):
+                foundry_agent_cli._qualification_snapshot(client, sdk)
+            client.agents.get.assert_not_called()
+            client.deployments.list.return_value = [types.SimpleNamespace(name="offline-model")]
+            self.assertEqual(foundry_agent_cli._qualification_snapshot(client, sdk),
+                             {"found": False, "modelMatched": True})
+
+    def test_qualification_delete_rejects_unowned_inventory_or_changed_snapshot(self):
+        client = types.SimpleNamespace(agents=types.SimpleNamespace(delete=mock.Mock()))
+        snapshot = {"found": True, "versions": [{"id": "owned-id", "metadata": {"qualification_experiment": "other"}}]}
+        env = {"QUAL_PROJECT_ENDPOINT": "https://example.invalid", "AZURE_TENANT_ID": "offline-tenant",
+               "AZURE_TOKEN_CREDENTIALS": "AzureCliCredential", "QUAL_EXPERIMENT_ID": "owned-experiment"}
+        with mock.patch.dict(os.environ, env), \
+             mock.patch.object(foundry_agent_cli, "_create_client", return_value=({}, object(), client)), \
+             mock.patch.object(foundry_agent_cli, "_qualification_snapshot", return_value=snapshot), \
+             mock.patch.object(foundry_agent_cli, "_read_json_stdin", return_value=snapshot):
+            with self.assertRaisesRegex(ValueError, "QUAL_CLEANUP_BLOCKED"):
+                foundry_agent_cli._handle_qualification_target(types.SimpleNamespace(command="qualification-delete"))
+            client.agents.delete.assert_not_called()
+            with mock.patch.object(foundry_agent_cli, "_read_json_stdin", return_value={"found": True, "versions": []}):
+                with self.assertRaisesRegex(ValueError, "QUAL_CLEANUP_BLOCKED"):
+                    foundry_agent_cli._handle_qualification_target(types.SimpleNamespace(command="qualification-delete"))
+            client.agents.delete.assert_not_called()
 
     def test_definition_to_sdk_kwargs_maps_supported_fields_and_warns_for_unsupported_input(self):
         payload = {
@@ -800,7 +1091,7 @@ class FoundryAgentCliTests(unittest.TestCase):
                 result = bridge._handle_invoke_agent(args)
             print(json.dumps({{"requests": requests, "result": result, "previewOptIn": client._config.allow_preview, "openai": importlib.metadata.version("openai")}}))
         ''')
-        completed = subprocess.run([sys.executable, "-c", probe], cwd=REPO_ROOT, capture_output=True, text=True, timeout=30)
+        completed = subprocess.run([sys.executable, "-c", probe], cwd=REPO_ROOT, capture_output=True, text=True, timeout=90)
         self.assertEqual(0, completed.returncode, completed.stderr)
         result = json.loads(completed.stdout)
         self.assertEqual("3.17.0", result["openai"])

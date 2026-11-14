@@ -476,5 +476,130 @@ Prevent recurrence by removing human write access to the production project.
    pipeline-created version and its attested release record before deleting the portal-authored version.
 4. Archive the final release record, export, and last package to long-term storage for your retention period.
 5. Only then remove the agent in each environment, highest first, using the Agent Service API or portal. There
-   is no delete script: destructive removal remains a deliberate, reviewed act.
+   is no general-purpose delete script: destructive removal remains a deliberate, reviewed act.
 6. Remove connections, indexes, and Key Vault secrets used only by that agent.
+
+---
+
+## RB-12 Optional bounded DEV qualification (pending)
+
+**Status:** source implementation awaiting independent Tester, Security and Reviewer gates, then actual
+hosted privacy proof and read-only preflight. Existing offline/PR checks are not live/OIDC qualification.
+Do not dispatch Experiment merely because CI is green. This path does not qualify ordinary deployment,
+Azure DevOps, TEST/UAT/PROD, production readiness, model immutability or independent approval.
+
+The existing `deploy-dev` workflow defaults `qualificationMode` to **false**. Ordinary push/manual behavior
+is unchanged. Explicit qualification mode excludes every ordinary validate/package/deploy/summary job and
+never invokes generic reusable deployment, artifact uploads or automatic recovery.
+
+### External setup and human gates
+
+The maintainer must separately approve/configure the exact private DEV target, dedicated OIDC UAMI,
+project-scoped runtime grant, two container-scoped data grants, and thirty-day private evidence retention.
+Use the approved feature-branch restriction, administrative bypass disabled and manual DEV self-approval.
+Self-approval is operator authorization, **not** independent review or separation of duties.
+
+Inject these thirteen operational values as individual DEV **environment secrets**, not variables or
+credentials: `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_SUBSCRIPTION_ID`,
+`QUAL_FOUNDRY_RESOURCE_GROUP`, `QUAL_FOUNDRY_ACCOUNT`, `QUAL_FOUNDRY_PROJECT`,
+`QUAL_PROJECT_ENDPOINT`, `QUAL_MODEL_DEPLOYMENT`, `QUAL_STORAGE_ACCOUNT`,
+`QUAL_PACKAGE_CONTAINER`, `QUAL_RELEASE_CONTAINER`, `QUAL_EXPERIMENT_ID`, `QUAL_AGENT_NAME`.
+Never put their actual values in source, dispatch inputs, driver arguments, outputs or public artifacts.
+The unique agent must remain exclusively reserved; the fixed qualification concurrency group does not
+provide a shared lock with normal deployment, ADO or out-of-band operators.
+
+One additional benign `QUAL_PRIVACY_SENTINEL` seed is a reviewed setup detail; do not overwrite any real
+value or create another environment for proof. The first configuration-consuming shell step validates and
+masks all identifiers before exports, action inputs or login. PrivacyProof receives only the inert seed.
+It derives thirteen independently hashed typed canaries and uses the same validation/mask/export helper.
+It requests no OIDC token, constructs no Azure client, accesses no Azure target and performs no inference.
+
+For **each** phase, independently reviewed source is frozen as a full `expectedCommit` SHA on
+`squad/sdk-first-qualification`, matching dispatch/workflow/checkout SHA and run attempt 1:
+
+1. Manually approve `PrivacyProof`. Inspect **complete** setup, normal, negative-case, finalizer and post-job
+   logs, annotations, summaries and files. Confirm fixed log probes are masked and public non-log channels
+   contain only the allowlisted result. A failed, cancelled or incompletely inspected run is not proof.
+2. Separately approve `Preflight`, referencing that accepted `privacyProofRunId`. It uses the real thirteen
+   values and OIDC once; verifies CLI tenant/subscription/client identity, exact SDK model, absent agent and
+   both containers with OAuth; it creates no agent/version/claim/conversation and performs no inference.
+   Inspect its **complete** real-binding logs/output before proceeding. Use the private provisioning readback
+   for account/network/RBAC controls; no parent read/role fallback is implied.
+3. Only after both reviews, approve one `Experiment` with both proof run IDs at that same SHA and unchanged
+   private target/budget. Source or dependency drift invalidates prior acceptance. Action revisions are
+   pinned for this path; inspect the recorded SDK pins and installed CLI version too.
+
+Run IDs are operator-reviewed references, not API-authenticated proof of human inspection. One seed proves
+one automatically registered original-secret header plus thirteen derived explicit-mask cases, **not**
+thirteen independently observed original-secret headers, all transformations or guaranteed cancellation
+coverage. Real Preflight supplies the remaining observed binding coverage. Masking is defense in depth;
+summaries/files use suppression and a separate allowlist, not a masking assumption.
+
+### One irreversible budget claim, evidence first
+
+The driver accepts only `-Phase`, `-ExpectedCommit`, optional proof run IDs and optional `-PrivateRoot`
+beneath ignored `out/qualification`. There are no target/credential, retry, resume, force, cleanup-only or
+skip-gate switches. Runtime scratch and raw streams stay private; script summaries/outputs are redirected.
+OIDC login uses the installed Azure CLI interpreter in-process; credentials never become OS arguments.
+This does **not** prevent disk persistence: CLI/MSAL may cache the federated assertion and access/session
+state. The whole fresh, owner-restricted `out/qualification/authentication/run-<run-id>` directory is
+credential-bearing and separate from ordinary scratch and recursively exported evidence. Do not inspect,
+archive, upload or include it in any evidence inventory. Pre-existing paths, ownership drift and symlink/
+reparse aliases block use/removal; there is no inherited/default/global cache deletion fallback.
+Existing internal helpers may carry noncredential metadata in argv within the trusted runner boundary.
+Privileged runner administrators or compromised same-job code can inspect memory/environment/metadata;
+this is not argv-free execution or OS-level metadata isolation.
+
+Before any service mutation, an OAuth create-if-absent audit claim binds identities, SHA/run/proof references
+and the **shared** maximum of three version creates/nine Responses creates across all attempts. An existing
+claim refuses every rerun/re-dispatch. Each A/B/C reservation durably consumes one create and three possible
+sends before calls; persistence failure blocks calls. Ambiguous operations consume allowance, with no refund.
+Management CREATE and Responses have zero automatic retries. This cooperative guard is not a hard request
+quota or dollar cap.
+
+- **A:** original private DEV-only 1.0.0 package; two existing smoke canaries and the first delivery evaluation
+  record execute live, bound to its exact release; attest succeeded and durably retain original ZIP/JSON.
+- **B:** 1.0.1 plus a benign instruction change, same real model. Only smoke's deliberately unequal
+  model-expectation assertion may fail. Both live canaries and its one evaluation must pass. Attestation
+  must persist B as failed using unedited originals; exception text alone is insufficient.
+- **C:** central rollback receives B's exact failed record, actual staged A artifact/JSON, copied ConfigRoot
+  and live suite. It creates a new service version and owns its two smoke/one evaluation/attestation.
+  No outer rerun, fourth create, tenth send or recursive automatic rollback is allowed.
+
+An unexpected failure stops normal progression. Retain all available original evidence; do not reinterpret
+it as the expected B failure. In qualification context, the bridge returns `PrimaryStatus` and a typed
+`InvocationCleanup` envelope. Each known conversation DELETE and acquired-resource close is attempted once
+within the invocation deadline, without retry. A failed/ambiguous cleanup withholds usable success output;
+the module persists a bounded private receipt and throws before either runner can start another invocation.
+This also applies to central C rollback. Ordinary nonqualification warning behavior is unchanged.
+Original ZIPs go to the package container; original release/mutation/gate/
+selector evidence, private logs and a hash inventory go to the audit container. Verify exact OAuth
+readback bytes before cleanup. Export failure, unknown inventory, ambiguous ownership, identity or route
+drift prevents deletion. Only the exact claimed agent/owned versions may be deleted; verify absence and
+retain its receipt. Infrastructure, federation, grants and their continuing costs remain until a separate
+teardown decision. Later human evidence access needs existing authorization or separate narrow approval.
+Retaining failed-experiment evidence and safely removing its agent cannot make that experiment successful.
+Private `agentRemovalVerified` is distinct from invocation cleanup; public generic `cleanupVerified` stays
+false after failed/unverified invocation cleanup. A secondary retention/removal error does not erase the
+primary failure or reopen the irreversible budget.
+
+Only after the last Azure/storage consumer, including failure-evidence export and guarded agent removal,
+does the real-phase workflow `always()` finalizer remove the exact job-owned CLI directory and verify
+local absence. It also runs after handled login/driver failure. Catchable removal/verification failure emits
+only `QUAL_AUTH_CLEANUP_FAILED` and fails the job; no re-login or Azure logout is performed. Not-created
+and verified-removed are distinct constant receipts. PrivacyProof neither authenticates nor proves real
+authentication teardown.
+
+This lifecycle assumes a trusted ephemeral standard hosted runner, not a shared/persistent/self-hosted host.
+Cancellation runs cleanup only where the runner still executes steps. Forced termination, timeout enforcement,
+runner loss or process kill may prevent finalization and leave credential-bearing files until hosted-runner
+disposal; do not claim infallible cleanup, secure memory erasure, credential revocation or independent proof
+of disposal.
+
+Public output is a separately constructed fixed allowlist of phase/status, reviewed SHA, bounded reserved
+counts and expected-failure/recovery/retention/cleanup booleans. It is explicitly **phase-only**, with
+authentication teardown pending for real phases. Whole-job success additionally requires the finalizer's
+verified result; an earlier phase pass is not an unqualified qualification pass. Exit 0 means actual phase postconditions
+passed, 2 means blocked before entering the experiment, 1 means failure after claiming it. Never upload
+arbitrary `out` directories or raw evidence. A successful bounded configuration-failure/recovery scenario
+is not an outage/model-regression test or a passed B release.

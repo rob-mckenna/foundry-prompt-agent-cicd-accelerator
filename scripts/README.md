@@ -1,8 +1,8 @@
 # Scripts
 
-PowerShell 7 automation. Every script sets `#Requires -Version 7.2`, `Set-StrictMode -Version 3.0` and
-`$ErrorActionPreference = 'Stop'`. Every script that changes state declares `SupportsShouldProcess`, so
-`-WhatIf` and `-Confirm` work everywhere they should.
+PowerShell 7 automation. Entry points require PowerShell 7.2, strict mode and stop-on-error behavior.
+Regular deployment scripts expose `SupportsShouldProcess`. The separately gated qualification driver
+instead requires a frozen-source hosted phase; it deliberately has no skip, force, resume or WhatIf mode.
 
 Real deployment, promotion, rollback, live smoke/evaluation/regression and export-by-name operations require
 Python 3.10+ plus the pinned SDK dependencies in `scripts/python/requirements.txt`:
@@ -25,6 +25,7 @@ reads Key Vault before that return and therefore is not an offline rehearsal. `e
 | Script | Purpose | Azure needed | Mutates |
 | --- | --- | --- | --- |
 | `Invoke-Validation.ps1` | Full offline validation of the repository | no | no |
+| `Invoke-DevQualification.ps1` | Default-off, separately approved frozen-source qualification phase | not PrivacyProof; yes otherwise | Experiment only (cloud) |
 | `New-AgentPackage.ps1` | Build the immutable, content-addressed package | no | local files |
 | `Test-AgentPackage.ps1` | Verify integrity, content address and per-environment resolution | no | no |
 | `import-agent.ps1` | Deploy a package to one environment | yes | remote agent |
@@ -46,12 +47,52 @@ against the same local or federated identity context:
 | GitHub Actions | `azure/login@v2` with OIDC and `permissions: id-token: write` |
 | Azure DevOps | `AzureCLI@2` with a workload identity federation service connection |
 
+The optional qualification job is different: its installed Azure CLI interpreter invokes OIDC login
+in-process, so the federated token is not an OS process argument. Azure CLI/MSAL **can persist the
+assertion and session/access state on disk**. The entire fresh, owner-restricted
+`out/qualification/authentication/run-<run-id>` directory is transient credential-bearing material,
+separate from ordinary scratch and exported evidence; never inspect, upload or retain its contents.
+The pinned SDK
+credential chain is restricted to that CLI session with `AZURE_TOKEN_CREDENTIALS=AzureCliCredential`.
+After the final Azure/storage consumer, an `always()` real-phase finalizer removes only the recorded
+job-created directory and verifies absence. Login/driver failure also enters that finalizer; an unowned,
+aliased or unverifiable path fails closed, without touching a default/shared CLI cache.
+Earlier results are explicitly phase-only, authentication teardown pending; teardown failure fails the job.
+This is bounded best effort on trusted ephemeral standard hosted runners. Forced termination, runner
+loss or timeout enforcement can prevent finalization and leave files until runner disposal. It is not
+credential revocation, cryptographic erasure or proof of disposal, and does not support persistent/shared
+self-hosted runners.
+This depends on the hosted Ubuntu CLI layout and fails closed if it changes; it is pending independent
+review and hosted proof, not an already qualified authentication path.
+Qualification source checkout is anonymous and frozen to the reviewed SHA on this public repository;
+it has no checkout token, credential helper or persisted Git authentication. Private-repository use
+is intentionally unsupported by this path rather than introducing a credential-argv fallback.
+
 `Get-FoundryAccessToken` calls `az account get-access-token --scope <tokenScope>` and immediately converts the
 result to a `SecureString`. Tokens are passed to `Invoke-RestMethod` with PowerShell's bearer authentication,
 so no bearer value is assembled into a header string, a log line or a command-line argument. This token is
 used only by retained legacy get-by-ID export, not by deployment or live runtime.
 
 ## Common workflows
+
+### Optional bounded DEV qualification — pending hosted proof
+
+See [RB-12](../docs/deployment-runbook.md#rb-12-optional-bounded-dev-qualification-pending)
+for the ordered review/privacy/preflight/experiment gates. Only `-Phase`, `-ExpectedCommit`,
+`-PrivacyProofRunId`, `-PreflightRunId` and a repository-local ignored `-PrivateRoot` are accepted;
+configuration and credentials are not CLI arguments. The driver is not a local live-test command.
+
+The qualification path alone passes `-DisableCreateRetries` through import, the module/bridge and
+central rollback. This sets supported Azure Core retry options to zero on the version-creation client.
+Ordinary callers retain their existing defaults. Runtime Responses already use zero SDK retries.
+`FOUNDRY_QUALIFICATION_PRIVATE_ROOT` is an internal scratch-directory binding, validated beneath
+`out/qualification`; absent that binding, existing deployment work paths are unchanged.
+That binding also requires a typed, verified invocation-cleanup result before either existing live runner
+can continue. Conversation DELETE and each acquired-resource close are attempted once; failed/ambiguous
+cleanup withholds usable output and stops subsequent inference, including B's expected-failure path and C.
+Private receipts distinguish primary invocation status, invocation cleanup and evidence-first agent removal.
+Successful agent removal alone cannot mark failed invocation cleanup verified. Ordinary callers retain
+their previous completed-with-warning cleanup behavior.
 
 ### Validate everything, offline
 

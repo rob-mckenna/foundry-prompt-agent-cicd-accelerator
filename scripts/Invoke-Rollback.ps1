@@ -69,6 +69,8 @@ param(
 
     [string]$EvaluationSuitePath,
 
+    [switch]$DisableCreateRetries,
+
     [Parameter(Mandatory)]
     [ValidateNotNullOrEmpty()]
     [string]$Reason,
@@ -157,7 +159,7 @@ Write-OpsLog -Level Info -Message "Rollback target: $ToPackageId"
 $artifactRoot = Resolve-RequiredPath -Path $ArtifactDirectory -Purpose 'Artifact directory'
 $packagePath = $null
 foreach ($candidate in (Get-ChildItem -LiteralPath $artifactRoot -Recurse -Filter '*.zip' -File)) {
-    $extractRoot = Join-Path $repoRoot ("out\platform-work\foundry-rollback-" + [Guid]::NewGuid().ToString('n'))
+    $extractRoot = Join-Path (Get-FoundryWorkRoot) ("foundry-rollback-" + [Guid]::NewGuid().ToString('n'))
     try {
         $root = Expand-AgentPackage -PackagePath $candidate.FullName -Destination $extractRoot
         $descriptor = Read-PackageDescriptor -PackageRoot $root
@@ -229,6 +231,7 @@ $importParameters = @{
     BusinessSignoffId = $BusinessSignoffId
     RollbackReason   = $Reason
 }
+if ($DisableCreateRetries) { $importParameters['DisableCreateRetries'] = $true }
 if ($ConfigRoot) { $importParameters['ConfigRoot'] = $ConfigRoot }
 if ($originalChangeRecordId) { $importParameters['OriginalChangeRecordId'] = $originalChangeRecordId }
 

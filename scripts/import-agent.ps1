@@ -104,6 +104,8 @@ param(
 
     [string]$RollbackTargetRecordPath,
 
+    [switch]$DisableCreateRetries,
+
     [ValidateSet('None', 'AfterPackagePublication', 'AfterActivation')]
     [string]$TestFailurePoint = 'None'
 )
@@ -118,7 +120,7 @@ if (-not $ReleaseDirectory) { $ReleaseDirectory = Join-Path $repoRoot 'out/relea
 if (-not $RollbackStageDirectory) { $RollbackStageDirectory = Join-Path $ReleaseDirectory 'rollback-staged' }
 if (-not $DeploymentEvidencePath) { $DeploymentEvidencePath = Join-Path $ReleaseDirectory 'deployment-evidence.json' }
 
-$extractRoot = Join-Path $repoRoot ("out\platform-work\foundry-pkg-" + [Guid]::NewGuid().ToString('n'))
+$extractRoot = Join-Path (Get-FoundryWorkRoot) ("foundry-pkg-" + [Guid]::NewGuid().ToString('n'))
 $cleanupRequired = $false
 $descriptor = $null
 $config = $null
@@ -434,7 +436,9 @@ try {
     $recordPath = Save-ReleaseRecord -Record $record -EnvironmentConfig $config -LocalDirectory $ReleaseDirectory -Confirm:$false
     $mutationStarted = $true
     Write-DeploymentEvidence
-    $createdVersion = New-FoundryAgentVersion -EnvironmentConfig $config -LogicalName $agentName -Payload $payload
+    $createOptions = @{}
+    if ($DisableCreateRetries) { $createOptions['DisableCreateRetries'] = $true }
+    $createdVersion = New-FoundryAgentVersion -EnvironmentConfig $config -LogicalName $agentName -Payload $payload @createOptions
     Write-OpsLog -Level Success -Message "Created agent version $($createdVersion.version) for '$agentName'."
 
     if ($createdVersion.PSObject.Properties.Name -contains 'agentId' -and $createdVersion.agentId) {

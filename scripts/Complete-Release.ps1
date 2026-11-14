@@ -83,7 +83,7 @@ $config = Get-EnvironmentConfig -Environment $environment -ConfigRoot $ConfigRoo
 $evidence = @{}
 $gates = @{ requireSmokeTestPass = $true; requireEvaluationPass = $false; requireRegressionPass = $false; minimumEvaluationScore = $null }
 $validationFailure = $null
-$extractRoot = Join-Path $repoRoot ("out\platform-work\foundry-attest-" + [Guid]::NewGuid().ToString('n'))
+$extractRoot = Join-Path (Get-FoundryWorkRoot) ("foundry-attest-" + [Guid]::NewGuid().ToString('n'))
 try {
     $packageRoot = Expand-AgentPackage -PackagePath $PackagePath -Destination $extractRoot
     $descriptor = Read-PackageDescriptor -PackageRoot $packageRoot
